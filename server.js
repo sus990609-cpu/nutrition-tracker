@@ -69,7 +69,8 @@ function toInt(value, fallback) {
 
 const API_KEY = String(envValue("KIMI_API_KEY", "") || "").trim();
 const TEXT_MODEL = String(envValue("KIMI_TEXT_MODEL", "kimi-k2.7-code") || "").trim() || "kimi-k2.7-code";
-// 视觉模型独立配置：默认阿里云百炼 qwen3-vl-plus（OpenAI 兼容端点），与文本上游解耦
+// 视觉模型独立配置：默认阿里云百炼 qwen3-vl-plus（OpenAI 兼容端点），与文本上游解耦。
+// 注意：qwen3.7-flash 不支持图片输入，拍照估算必须用 vl 系列模型。
 const VISION_API_KEY = String(envValue("VISION_API_KEY", "") || "").trim();
 const VISION_MODEL = String(envValue("VISION_MODEL", "qwen3-vl-plus") || "").trim() || "qwen3-vl-plus";
 const RPM = Math.max(1, toInt(envValue("KIMI_RPM", 3), 3));
@@ -85,10 +86,10 @@ const AI_BACKOFF_FACTOR = 1.5;
 const AI_MAX_BACKOFF_MS = 8000;
 const AI_MAX_TOTAL_WAIT_MS = 40000;
 
-// 文本模型（kimi-k2.7-code）无法关闭思考，reasoning 会占用 max_tokens：
-// 800 实测会被 reasoning 吃满并截断 JSON；2000 留足余量，截断时再用 2600 自动重试一次。
-const SEARCH_MAX_TOKENS = 2000;
-const SEARCH_RETRY_MAX_TOKENS = 2600;
+// 文本模型带 reasoning，思考会占用 max_tokens（qwen3.7-flash 实测约 300，kimi-k2.7-code 566+）：
+// 预算需覆盖"思考 + JSON 输出"。4000 留足余量，截断时再用 5000 自动重试一次。
+const SEARCH_MAX_TOKENS = 4000;
+const SEARCH_RETRY_MAX_TOKENS = 5000;
 // 视觉模型（qwen3-vl-flash）输出 JSON 较短，1600 足够
 const VISION_MAX_TOKENS = 1600;
 
@@ -479,7 +480,10 @@ async function callModel(model, messages, maxTokens, opts) {
 /* ---------- JSON 提取与校验 ---------- */
 function extractJson(text) {
   let t = String(text || "").trim();
-  t = t.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+  // 剥离 ```json ... ``` 代码围栏（qwen 系模型常带，即使 system 已要求只输出 JSON）
+  const fence = t.match(/```(?:json|JSON)?\s*([\s\S]*?)```/);
+  if (fence && fence[1]) t = fence[1].trim();
+  t = t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
   try { return JSON.parse(t); } catch {}
   const start = t.indexOf("{");
   const end = t.lastIndexOf("}");
@@ -575,8 +579,8 @@ async function foodSearch(query) {
     { role: "system", content: "你是营养数据库助手。只输出 JSON，不要 Markdown 代码块，不要解释。" },
     { role: "user", content: prompt }
   ];
-  // 文本模型 kimi-k2.7-code 无法关闭思考（thinking.type=disabled 会 400），
-  // reasoning 会占用 max_tokens：首次给 2000，仍因 length 截断时用 2600 自动重试一次。
+  // 文本模型带 reasoning（qwen3.7-flash 思考约占 300 token，kimi-k2.7-code 更多），
+  // max_tokens 需覆盖"思考 + JSON 输出"：首次给 4000，仍因 length 截断时用 5000 自动重试一次。
   let attempt = await searchAttempt(messages, SEARCH_MAX_TOKENS);
   if (!attempt.parsed && attempt.truncated) {
     console.warn(`[api] food-search 输出被截断（max_tokens=${SEARCH_MAX_TOKENS}），用 ${SEARCH_RETRY_MAX_TOKENS} 重试一次`);
