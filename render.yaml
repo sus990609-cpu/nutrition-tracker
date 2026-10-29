@@ -1,0 +1,22 @@
+# Render.com 一键部署（免费档）：仓库根目录为 nutrition-tracker/，Build 用 Dockerfile
+# 使用方法：把本目录推到 GitHub → Render 新建 Blueprint → 选择仓库 → 按提示填 KIMI_API_KEY
+services:
+  - type: web
+    name: nutrition-tracker
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: TRUST_PROXY
+        value: "1"
+      - key: API_RATE_LIMIT
+        value: "20"
+      - key: API_RATE_WINDOW_MIN
+        value: "10"
+      - key: AI_MAX_RETRIES
+        value: "6"
+      - key: KIMI_API_KEY
+        sync: false
