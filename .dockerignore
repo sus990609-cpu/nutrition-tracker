@@ -1,0 +1,31 @@
+# 依赖与构建产物（本项目零依赖，仍然排除以防误拷大目录）
+node_modules
+npm-debug.log*
+
+# 密钥与本地配置：严禁进入镜像，运行时用 -e / --env-file 注入
+.env
+.env.*
+.env.local
+!.env.example
+
+# 测试、QA 与本地脚本（镜像运行不需要）
+qa
+test-harness.cjs
+*.cjs
+*.test.js
+*.log
+coverage
+
+# 文档与仓库元数据（容器运行不需要；也不希望被静态服务误暴露）
+README.md
+*.md
+.git
+.gitignore
+.github
+.gitlab-ci.yml
+.vscode
+.idea
+.dockerignore
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
