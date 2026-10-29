@@ -1,0 +1,14 @@
+{
+  "generatedAt": "2026-10-29T17:30:57.953Z",
+  "images": [
+    {
+      "id": "ex-gouben-rye",
+      "kind": "existing",
+      "query": "哥本 全麦魔芋五黑欧包 85g",
+      "source": "http://t14.baidu.com/it/u=3165757155,2296508281&fm=224&app=112&f=JPEG?w=500&h=500",
+      "bytes": 45467,
+      "preferred": true
+    }
+  ],
+  "missing": []
+}
