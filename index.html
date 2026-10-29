@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>每日营养管家 | Nutrition Tracker</title>
+  <meta name="theme-color" content="#2ecc71" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0d1318" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="营养管家">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="apple-touch-icon" href="assets/icons/apple-touch-icon-180.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <script>(function(){try{var t=localStorage.getItem("nutritionTheme")||((window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light");document.documentElement.dataset.theme=t;}catch(e){}})();</script>
+  <link rel="stylesheet" href="styles.css?v=20261030d">
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <div class="brand">
+        <span class="logo">🥗</span>
+        <h1>每日营养管家</h1>
+        <button class="install-btn" id="installAppBtn" type="button" hidden>📲 安装</button>
+        <button class="theme-btn" id="themeToggle" type="button" title="切换深浅色">🌙</button>
+      </div>
+      <nav class="main-nav" id="mainNav">
+        <button class="nav-btn active" data-tab="dashboard">今日总览</button>
+        <button class="nav-btn" data-tab="tracker">摄入记录</button>
+        <button class="nav-btn" data-tab="foods">食品查询</button>
+        <button class="nav-btn" data-tab="body">身体数据</button>
+        <button class="nav-btn" data-tab="plan">目标计划</button>
+        <button class="nav-btn" data-tab="ai">AI 拍照估营养</button>
+        <button class="nav-btn" data-tab="settings">个人设置</button>
+      </nav>
+    </header>
+
+    <main class="app-main" id="appMain">
+      <!-- 今日总览 -->
+      <section class="tab-panel active" id="dashboard">
+        <div class="panel-header">
+          <h2>今日总览</h2>
+          <p class="subtitle" id="todayDate"></p>
+        </div>
+        <div class="dashboard-grid">
+          <div class="summary-card calories">
+            <div class="card-title">卡路里</div>
+            <div class="card-value"><span id="sumCalories">0</span> / <span id="targetCalories">2000</span> <small>kcal</small></div>
+            <div class="progress-bar"><div class="progress-fill" id="calProgress"></div></div>
+          </div>
+          <div class="summary-card protein">
+            <div class="card-title">蛋白质</div>
+            <div class="card-value"><span id="sumProtein">0</span> / <span id="targetProtein">120</span> <small>g</small></div>
+            <div class="progress-bar"><div class="progress-fill" id="proProgress"></div></div>
+          </div>
+          <div class="summary-card carbs">
+            <div class="card-title">碳水</div>
+            <div class="card-value"><span id="sumCarbs">0</span> / <span id="targetCarbs">250</span> <small>g</small></div>
+            <div class="progress-bar"><div class="progress-fill" id="carbProgress"></div></div>
+          </div>
+          <div class="summary-card fat">
+            <div class="card-title">脂肪</div>
+            <div class="card-value"><span id="sumFat">0</span> / <span id="targetFat">65</span> <small>g</small></div>
+            <div class="progress-bar"><div class="progress-fill" id="fatProgress"></div></div>
+          </div>
+        </div>
+
+        <p class="hint" id="pendingNote"></p>
+
+        <div class="meal-distribution">
+          <h3>今日餐食分配</h3>
+          <div class="meal-cards" id="mealCards"></div>
+        </div>
+
+        <div class="recent-foods">
+          <h3>最近添加</h3>
+          <ul id="recentList" class="food-list"></ul>
+        </div>
+      </section>
+
+      <!-- 摄入记录 -->
+      <section class="tab-panel" id="tracker">
+        <div class="panel-header">
+          <h2>摄入记录</h2>
+          <p class="subtitle">搜索并选择食品，输入实际食用重量，自动计算营养；找不到的食品可新增自定义</p>
+        </div>
+        <div class="tracker-layout">
+          <div class="tracker-form card">
+            <h3>添加食物</h3>
+
+            <div class="form-row">
+              <label>餐次</label>
+              <select id="mealSelect"></select>
+            </div>
+
+            <div class="form-row">
+              <label for="foodNameInput">食品名称 / 品牌 / 别名</label>
+              <input type="text" id="foodNameInput" placeholder="例如：希腊酸奶、简爱、无糖酸奶" autocomplete="off">
+              <div class="search-results" id="trackerSearchResults"></div>
+              <div class="ai-search-row">
+                <button class="btn secondary" id="trackerAiBtn" hidden>✨ 用 AI 搜索营养</button>
+                <span class="hint" id="trackerAiHint"></span>
+              </div>
+              <div id="trackerAiResults"></div>
+            </div>
+
+            <div class="selected-food" id="selectedFoodCard" hidden>
+              <div class="selected-food-main">
+                <strong id="selectedFoodName"></strong>
+                <span class="food-meta" id="selectedFoodMeta"></span>
+              </div>
+              <div class="food-meta" id="selectedFoodNutrition"></div>
+              <button class="link-btn" id="clearFoodBtn" type="button">取消选择</button>
+            </div>
+
+            <div class="form-row">
+              <label>食用量</label>
+              <div class="input-group">
+                <input type="number" id="foodAmount" value="100" min="0.1" step="1">
+                <select id="amountUnit"></select>
+              </div>
+              <div class="hint" id="amountHint"></div>
+            </div>
+
+            <div class="preview-line" id="previewText"></div>
+
+            <details class="manual-macros" id="manualMacros">
+              <summary>手动输入营养（未选食品时使用，按每 100g 计）</summary>
+              <div class="macros-inputs">
+                <input type="number" id="inCalories" placeholder="kcal">
+                <input type="number" id="inProtein" placeholder="蛋白 g">
+                <input type="number" id="inCarbs" placeholder="碳水 g">
+                <input type="number" id="inFat" placeholder="脂肪 g">
+              </div>
+            </details>
+
+            <label class="check-row"><input type="checkbox" id="pendingCheck"> 暂存待补充（不计入今日统计）</label>
+
+            <button class="btn primary" id="addFoodBtn">➕ 添加到今日</button>
+            <button class="btn secondary" id="addCustomFoodBtn">✚ 新增自定义食品</button>
+
+            <div class="custom-food-form" id="customFoodForm" hidden>
+              <h4>新增自定义食品</h4>
+              <div class="form-row"><label>名称 *</label><input type="text" id="cfName" placeholder="例如：自制鸡胸肉沙拉"></div>
+              <div class="form-row"><label>品牌（可选）</label><input type="text" id="cfBrand" placeholder="例如：自制"></div>
+              <div class="form-row"><label>别名 / 搜索关键词（逗号分隔，可选）</label><input type="text" id="cfAliases" placeholder="例如：希腊酸奶, 高蛋白"></div>
+              <div class="form-row"><label>条形码（可选）</label><input type="text" id="cfBarcode" placeholder="8-14 位数字"></div>
+              <div class="form-row"><label>类别</label><select id="cfCategory"></select></div>
+              <div class="form-row"><label>基准单位</label>
+                <select id="cfUnit"><option value="g">每 100g</option><option value="ml">每 100ml</option></select>
+              </div>
+              <div class="form-row"><label>每 100g / 100ml 营养</label>
+                <div class="macros-inputs">
+                  <input type="number" id="cfCal" placeholder="kcal">
+                  <input type="number" id="cfPro" placeholder="蛋白 g">
+                  <input type="number" id="cfCarb" placeholder="碳水 g">
+                  <input type="number" id="cfFat" placeholder="脂肪 g">
+                </div>
+              </div>
+              <div class="form-row"><label>每份包装（可选）</label>
+                <div class="input-group">
+                  <input type="number" id="cfServingGrams" placeholder="每份重量 g/ml">
+                  <input type="text" id="cfServingLabel" placeholder="单位名，如 杯/袋">
+                </div>
+              </div>
+              <div class="btn-row">
+                <button class="btn primary" id="saveCustomFoodBtn">保存食品</button>
+                <button class="btn secondary" id="cancelCustomBtn">取消</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="tracker-list card">
+            <h3>今日记录</h3>
+            <div id="trackerEntries"></div>
+            <div class="tracker-total" id="trackerTotal"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 食品查询 -->
+      <section class="tab-panel" id="foods">
+        <div class="panel-header">
+          <h2>食品营养成分查询</h2>
+          <p class="subtitle">与摄入记录共用同一食品库；可粘贴包装上的配料表与营养成分表，核对后保存</p>
+        </div>
+        <div class="foods-layout">
+          <div class="card">
+            <h3>🔍 按名称 / 品牌搜索</h3>
+            <input type="text" id="foodSearchInput" class="search-input" placeholder="输入食品名称、品牌或别名，如：希腊酸奶、简爱、东方树叶..." autocomplete="off">
+            <div class="search-results" id="foodSearchResults"></div>
+            <div class="ai-search-row">
+              <button class="btn secondary" id="foodsAiBtn" hidden>✨ 用 AI 搜索营养</button>
+              <span class="hint" id="foodsAiHint"></span>
+            </div>
+            <div id="foodsAiResults"></div>
+            <div class="food-detail" id="foodDetail" hidden></div>
+          </div>
+          <div class="card">
+            <h3>📋 粘贴包装信息</h3>
+            <p class="hint">支持 Ctrl+V / Cmd+V 直接粘贴商品名称、配料表、营养成分表文本。识别后会先展示结果，核对确认后才保存。</p>
+            <textarea id="productText" rows="8" placeholder="示例：
+简爱 原味无糖酸奶
+配料：生牛乳、乳酸菌
+营养成分表（每100g）：能量 320kJ，蛋白质 3.8g，脂肪 3.5g，碳水化合物 4.5g，钠 55mg
+净含量：135g"></textarea>
+            <div class="btn-row">
+              <button class="btn secondary" id="pasteClipboardBtn">📋 从剪贴板粘贴</button>
+              <button class="btn primary" id="parseProductBtn">解析文本</button>
+            </div>
+            <div id="parsedPanel"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 身体数据 -->
+      <section class="tab-panel" id="body">
+        <div class="panel-header">
+          <h2>身体数据 & 健身指标</h2>
+          <p class="subtitle">输入身高、体重、年龄、性别，测算 BMI、BMR、TDEE 等</p>
+        </div>
+        <div class="body-layout">
+          <div class="card form-card">
+            <h3>基本信息</h3>
+            <div class="form-row">
+              <label>性别</label>
+              <select id="sex">
+                <option value="male">男</option>
+                <option value="female">女</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>年龄</label>
+              <input type="number" id="age" value="25">
+            </div>
+            <div class="form-row">
+              <label>身高 (cm)</label>
+              <input type="number" id="height" value="170">
+            </div>
+            <div class="form-row">
+              <label>体重 (kg)</label>
+              <input type="number" id="weight" value="65">
+            </div>
+            <div class="form-row">
+              <label>腰围 (cm，可选)</label>
+              <input type="number" id="waist" placeholder="用于估算体脂率">
+            </div>
+            <div class="form-row">
+              <label>颈围 (cm，可选)</label>
+              <input type="number" id="neck" placeholder="估算体脂率用，如 38">
+            </div>
+            <div class="form-row">
+              <label>臀围 (cm，女性估算体脂率时必填)</label>
+              <input type="number" id="hip" placeholder="如 95">
+            </div>
+            <div class="form-row">
+              <label>日常活动量</label>
+              <select id="activity">
+                <option value="1.2">久坐（几乎不运动）</option>
+                <option value="1.375">轻度活跃（每周 1-3 次运动）</option>
+                <option value="1.55" selected>中度活跃（每周 3-5 次运动）</option>
+                <option value="1.725">高度活跃（每周 6-7 次运动）</option>
+                <option value="1.9">极高（体力工作/每天大量训练）</option>
+              </select>
+            </div>
+            <button class="btn primary" id="calcBodyBtn">计算指标</button>
+          </div>
+          <div class="card result-card">
+            <h3>计算结果</h3>
+            <div class="metric-grid" id="bodyMetrics">
+              <div class="metric-item placeholder">点击左侧“计算指标”查看结果</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 目标计划 -->
+      <section class="tab-panel" id="plan">
+        <div class="panel-header">
+          <h2>减脂 / 增肌计划</h2>
+          <p class="subtitle">目标与身份画像分开设置；画像可跨类别多选，组合越完整，计划越贴合</p>
+        </div>
+        <div class="plan-layout">
+          <div class="card form-card">
+            <h3>目标设定</h3>
+            <div class="form-row">
+              <label>目标类型</label>
+              <select id="goalType">
+                <option value="lose">减脂</option>
+                <option value="gain">增肌</option>
+                <option value="maintain">保持</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>目标体重 (kg)</label>
+              <input type="number" id="targetWeight" value="60">
+            </div>
+            <div class="form-row">
+              <label>行动周期</label>
+              <div class="input-group">
+                <input type="number" id="planWeeks" value="12" min="1">
+                <span class="unit">周</span>
+              </div>
+            </div>
+            <div class="form-row">
+              <label>每日餐数</label>
+              <input type="number" id="mealsPerDay" value="3" min="2" max="8">
+            </div>
+
+            <h3 class="sub-heading">我的画像（可多选）</h3>
+            <div id="planProfileChips"></div>
+            <div class="selected-tags" id="selectedTagsSummary"></div>
+
+            <button class="btn primary" id="generatePlanBtn">生成计划</button>
+          </div>
+          <div class="card result-card" id="planResultCard">
+            <h3>计划概览</h3>
+            <div id="planOverview" class="placeholder">点击“生成计划”查看你的专属方案</div>
+          </div>
+        </div>
+        <div class="card plan-timeline" id="planTimeline" style="display:none;">
+          <h3>计划时间线</h3>
+          <div id="timelineContent"></div>
+        </div>
+      </section>
+
+      <!-- AI 拍照估营养 -->
+      <section class="tab-panel" id="ai">
+        <div class="panel-header">
+          <h2>AI 拍照估算营养</h2>
+          <p class="subtitle">上传、拖拽或粘贴食物照片，选择参照物与形态参数，得到带区间的估算结果，确认后再计入摄入</p>
+        </div>
+        <div class="ai-layout">
+          <div class="card">
+            <h3>1. 添加照片</h3>
+            <div class="dropzone" id="aiDropzone" tabindex="0">
+              <input type="file" id="aiPhotoInput" accept="image/*" hidden>
+              <div class="dropzone-inner" id="aiPreview">
+                <div class="dropzone-icon">📷</div>
+                <p>点击上传 · 拖拽图片到此处 · 或按 <kbd>Ctrl</kbd>+<kbd>V</kbd> 粘贴</p>
+                <p class="hint">支持截图直接粘贴；剪贴板没有图片时会给出提示</p>
+              </div>
+            </div>
+            <div class="btn-row" id="aiPhotoActions" hidden>
+              <button class="btn secondary" id="aiReplaceBtn">替换照片</button>
+              <button class="btn danger" id="aiRemoveBtn">删除照片</button>
+            </div>
+
+            <h3>2. 参照物</h3>
+            <div class="ref-mode-row" id="refModeRow">
+              <label><input type="radio" name="refMode" value="object" checked> 物品参照</label>
+              <label><input type="radio" name="refMode" value="body"> 人体部位参照</label>
+              <label><input type="radio" name="refMode" value="none"> 无参照</label>
+            </div>
+            <div class="form-row">
+              <label id="refObjectLabel">参照物</label>
+              <select id="refObject"></select>
+            </div>
+            <div class="ref-guide" id="refGuide"></div>
+
+            <h3>3. 拍摄提示</h3>
+            <ul class="tips-list">
+              <li>尽量清晰、无遮挡，展示食物完整范围与可见厚度。</li>
+              <li>参照物与食物放在相近的拍摄平面，避免透视误差。</li>
+              <li>多种食物混放时，尽量分开或让每种都清晰可辨。</li>
+              <li>酱汁、额外用油会明显改变热量，请在下方如实选择。</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <h3>4. 食物与分量</h3>
+            <div id="aiRows"></div>
+            <button class="btn secondary" id="aiAddRowBtn">✚ 再加一种食物</button>
+            <div class="form-row" style="margin-top:14px;">
+              <label>统一烹饪方式</label>
+              <select id="cookMethod">
+                <option value="raw">生食 / 凉拌</option>
+                <option value="steam">蒸煮 / 水煮</option>
+                <option value="lowoil" selected>少油烹饪</option>
+                <option value="highoil">多油煎炒</option>
+                <option value="fried">油炸</option>
+              </select>
+            </div>
+            <div class="ai-api-box">
+              <label for="aiDescription">补充描述（可选，帮助 AI 判断份量与做法）</label>
+              <textarea id="aiDescription" rows="2" placeholder="例如：米饭约一个拳头，鸡胸肉约手掌大，表面有少量油，旁边有西兰花"></textarea>
+              <div class="btn-row">
+                <button class="btn primary" id="aiApiEstimateBtn">✨ AI 识别并估算</button>
+                <span class="hint" id="apiStatus"></span>
+              </div>
+            </div>
+            <button class="btn secondary" id="aiEstimateBtn">本地几何估算（不调用 AI）</button>
+
+            <div id="aiResult" class="ai-result placeholder">估算结果会显示在这里，可修改后确认加入今日摄入</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 个人设置 -->
+      <section class="tab-panel" id="settings">
+        <div class="panel-header">
+          <h2>个人设置</h2>
+          <p class="subtitle">管理默认画像、数据与偏好</p>
+        </div>
+        <div class="settings-grid">
+          <div class="card">
+            <h3>默认画像（多选）</h3>
+            <p class="hint">保存后会自动带入目标计划；可在计划页随时调整。</p>
+            <div id="settingsProfileChips"></div>
+            <div class="form-row">
+              <label>每日默认餐数</label>
+              <input type="number" id="defaultMeals" value="3" min="2" max="8">
+            </div>
+            <button class="btn primary" id="saveSettingsBtn">保存设置</button>
+          </div>
+          <div class="card">
+            <h3>数据管理</h3>
+            <p class="hint">所有数据保存在浏览器本地，不会上传服务器。自定义食品、画像与记录随数据一起导出。</p>
+            <button class="btn secondary" id="exportDataBtn">📤 导出数据 (JSON)</button>
+            <button class="btn secondary" id="importDataBtn">📥 导入数据</button>
+            <input type="file" id="importFile" accept=".json" style="display:none;">
+            <button class="btn danger" id="clearDataBtn">🗑️ 清空所有数据</button>
+          </div>
+          <div class="card">
+            <h3>AI 服务</h3>
+            <p class="hint" id="backendStatus">检查中…</p>
+            <p class="hint">API Key 只保存在服务器的 <code>.env</code> 中，前端只调用同源 <code>/api</code>，不会暴露密钥。</p>
+            <p class="hint">账号限制约 3 次/分钟，搜索会缓存，识别会排队；若提示繁忙请稍后再试。</p>
+          </div>
+          <div class="card">
+            <h3>数据来源与可靠性</h3>
+            <ul class="hint">
+              <li><span class="badge ref">参考值</span> 内置食物成分参考值，非官方检测。</li>
+              <li><span class="badge label">包装标签</span> 用户粘贴/录入的包装营养成分表。</li>
+              <li><span class="badge user">用户自定义</span> 用户自行填写的数据。</li>
+              <li><span class="badge pending">待确认</span> 信息不完整或仅有配料表，不能用于精确计算。</li>
+              <li><span class="badge ai">AI 估算</span> 由 AI 生成的参考值，需人工核对。</li>
+            </ul>
+            <p class="hint">品牌商品营养数据为演示用参考值，实际请以包装标签为准；本工具不构成医疗建议。</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>每日营养管家 · 本地运行 · 数据仅保存在你的浏览器</p>
+    </footer>
+  </div>
+
+  <script src="catalog.js?v=20261030d"></script>
+  <script src="app.js?v=20261030d"></script>
+  <script>
+  /* PWA：注册 Service Worker（HTTPS 或 localhost 下生效） */
+  (function () {
+    if (!("serviceWorker" in navigator)) return;
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js", { scope: "./" }).catch(function (err) {
+        console.warn("Service Worker 注册失败（需 HTTPS 或 localhost）：", err && err.message);
+      });
+    });
+  })();
+  </script>
+</body>
+</html>
