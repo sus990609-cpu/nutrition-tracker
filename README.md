@@ -59,10 +59,12 @@ docker compose up -d --build     # 会读取 .env 里的 KIMI_API_KEY
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `KIMI_API_KEY` | 空 | **必填**。Kimi API Key，只在服务端使用；未配置时 `/api/*` 返回 503（本地功能不受影响） |
-| `KIMI_BASE_URL` | `https://api.moonshot.cn/v1` | 上游地址，**支持 `http://` 与 `https://`**（自建代理/本地 mock 均可） |
-| `KIMI_TEXT_MODEL` | `kimi-k2.7-code` | 文本模型（食品查询） |
-| `KIMI_VISION_MODEL` | `kimi-k2.6` | 视觉模型（拍照估算） |
+| `KIMI_API_KEY` | 空 | **必填**。文本上游 API Key（OpenAI 兼容），只在服务端使用；未配置时 `/api/*` 返回 503（本地功能不受影响） |
+| `KIMI_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 文本上游地址，**支持 `http://` 与 `https://`**（百炼 / Kimi / 任意 OpenAI 兼容服务均可） |
+| `KIMI_TEXT_MODEL` | `qwen3.7-flash` | 文本模型（食品查询）。带 reasoning，预算已覆盖思考 |
+| `VISION_API_KEY` | 空 | **拍照估算必填**。视觉上游 Key（不填则回退用 KIMI_API_KEY） |
+| `VISION_BASE_URL` | 同文本上游 | 视觉上游地址（默认也是百炼 compatible-mode） |
+| `VISION_MODEL` | `qwen3-vl-plus` | 视觉模型。**必须用 vl 系列**——qwen3.7-flash 不支持图片输入 |
 | `KIMI_RPM` | `3` | 上游账号每分钟请求数，服务端按此串行排队 + 搜索缓存 |
 | `HOST` | `127.0.0.1` | 监听地址。`0.0.0.0` = 所有网卡（局域网/公网可访问，会打印风险提示） |
 | `PORT` | `8080` | 监听端口 |
@@ -181,7 +183,7 @@ server {
   - `GET /api/health`：返回 `host`、`port`、`textModel`、`visionModel`、`models`（实际生效的文本/视觉模型）、`maxTokens`（输出预算）、`rpm`、`rateLimit`（limit/windowMin/trustProxy）、`hasApiKey`、`queue`、`uptimeSec`，便于部署排查。
   - `POST /api/food-search`：`{query}` → AI 返回最多 4 条食品（每 100g 营养、类别、每份重量、置信说明）。
   - `POST /api/estimate-photo`：`{image, reference, description, cookMethod, hints}` → 识别食物并返回重量/热量区间、宏量营养素、不确定性说明。
-- 模型：文本 `kimi-k2.7-code`，视觉 `kimi-k2.6`。**文本模型无法关闭思考**（`thinking.type=disabled` 会被上游 400 拒绝），reasoning 会占用 `max_tokens`，因此输出预算必须覆盖思考：食品查询首次给 2000 tokens，若 `finish_reason=length` 导致 JSON 被截断，会自动用 2600 tokens 重试一次，仍失败才返回「AI 输出被截断」；视觉 `kimi-k2.6` 支持 `thinking.type=disabled`，1600 tokens 实测足够。
+- 模型：文本 `qwen3.7-flash`（阿里云百炼），视觉 `qwen3-vl-plus`。**文本模型带 reasoning**，会占用 `max_tokens`，因此输出预算必须覆盖思考：食品查询首次给 4000 tokens，若 `finish_reason=length` 导致 JSON 被截断，会自动用 5000 tokens 重试一次，仍失败才返回「AI 输出被截断」。视觉 `qwen3-vl-plus` 实测稳定，1600 tokens 足够。
 - 账号限制约 **3 次/分钟**：后端做串行队列（约 20 秒一次）与 30 分钟搜索缓存；界面会显示“AI 搜索中/排队”，失败会给出明确提示。
 - 上游 `KIMI_BASE_URL` 支持 `http://`/`https://`（便于接自建代理或本地 mock）；上游返回 401/403 时前端会看到“服务端 AI Key 无效或权限不足（请检查 KIMI_API_KEY）”，模型名不可用时提示检查模型配置。
 - 服务器拒绝访问 `.env`、`server.js`、`package.json`、`.cjs` 等文件；所有响应 `Cache-Control: no-store`，改完刷新即可看到变化。
@@ -250,7 +252,7 @@ npm test           # 等价于 node test-harness.cjs
 
 - 账号 RPM 约 3：并发高时会排队；搜索有缓存，识图无缓存。分享给多人时是**共享同一个账号额度**。
 - **Kimi 账号并发限制约 1**：同一账号同时只处理约 1 个请求，超出时会返回 **429**（前端会显示服务端提示和建议重试秒数，请稍后再试）；后端进程空闲被系统/终端回收后，浏览器会报「无法连接 AI 后端」，重新运行 `start-server.cmd`/`node server.js` 后切回页面会自动重连。
-- 文本模型 `kimi-k2.7-code` 始终带 reasoning（无法关闭思考），会占用 `max_tokens` 并增加耗时；极端情况下输出被截断会先自动提高预算重试一次。
+- 文本模型 `qwen3.7-flash` 带 reasoning，会占用 `max_tokens` 并增加耗时；极端情况下输出被截断会先自动提高预算重试一次。视觉估算必须使用 vl 系列模型（如 `qwen3-vl-plus`），纯文本模型不支持图片输入。
 - 视觉识别受拍摄角度、遮挡、参照物与厚度影响，输出一定是区间，不应视为精确测量；AI 只会把参照物名称作为提示，无法真正按像素标定尺寸。
 - 体脂率为公式估算值（美国海军公式），个体差异大；围度测量误差会明显影响结果。
 - AI 营养数据为估算/参考，品牌商品请以包装标签为准。
