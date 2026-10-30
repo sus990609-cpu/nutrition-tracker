@@ -1,13 +1,14 @@
-# 每日营养管家（Nutrition Tracker）v3.5
+# 每日营养管家（Nutrition Tracker）v3.6
 
-本地单页应用 + 零依赖 Node 后端。记录每日营养、查询食品、生成计划；AI 搜索与拍照估算通过后端代理调用 Kimi，**API Key 不会出现在前端**。数据仍保存在浏览器 localStorage，可自托管、可分享给他人使用。
+本地单页应用 + 零依赖 Node 后端。记录每日营养、查询食品、生成计划；AI 搜索与拍照估算通过后端代理调用百炼（qwen3.7-flash / qwen3-vl-plus），**API Key 不会出现在前端**。自 v3.6 起 AI 功能需要**邮箱验证码登录**（每设备每天 5 次试用额度）。数据仍保存在浏览器 localStorage，可自托管、可分享给他人使用。
 
 ## 快速开始
 
-需要 Node.js（18+，推荐 20+），**无需 `npm install`**（零第三方依赖）。
+需要 **Node.js >= 22.5（内置 `node:sqlite`，推荐 24 LTS）**，**无需 `npm install`**（零第三方依赖）。
 
 ```bash
-# 1) 创建配置：复制 .env.example 为 .env，填入 KIMI_API_KEY
+# 1) 创建配置：复制 .env.example 为 .env，填入 KIMI_API_KEY / VISION_API_KEY
+#    若要开放注册登录，再填 SMTP_HOST / SMTP_USER / SMTP_PASS（QQ 邮箱用「授权码」）
 # 2) 启动（同时提供静态页面与 /api）
 npm start          # 等价于 node server.js
 ```
@@ -28,7 +29,7 @@ Windows 也可直接双击项目根目录的 `start-server.cmd` 启动、`stop-s
 
 ## 部署与分享
 
-本服务是单进程、无数据库、零依赖的 Node 程序：所有数据在**访问者的浏览器 localStorage** 里，服务端只做静态文件与 AI 代理。因此“部署”= 起一个 Node 进程 + 注入 Key；“分享”= 把地址给他人，他们用同一份服务、消耗你的 Kimi 额度。
+本服务是单进程、零第三方依赖的 Node 程序：记录类数据在**访问者的浏览器 localStorage** 里，服务端提供静态页面、AI 代理与账号存储（SQLite 文件 `DATA_DIR`，默认 `./.data/app.db`，只存邮箱/哈希验证码/会话哈希/用量计数）。因此“部署”= 起一个 Node 进程 + 注入 Key 与 SMTP；“分享”= 把地址给他人，他们注册后消耗你的百炼额度（每人每天限 5 次 AI）。
 
 ### 一键部署（最快拿到公网网址）
 
@@ -68,9 +69,14 @@ docker compose up -d --build     # 会读取 .env 里的 KIMI_API_KEY
 | `KIMI_RPM` | `3` | 上游账号每分钟请求数，服务端按此串行排队 + 搜索缓存 |
 | `HOST` | `127.0.0.1` | 监听地址。`0.0.0.0` = 所有网卡（局域网/公网可访问，会打印风险提示） |
 | `PORT` | `8080` | 监听端口 |
-| `API_RATE_LIMIT` | `30` | 每个客户端 IP 每窗口内 `/api/*` 最多请求次数；`0` = 关闭 |
+| `API_RATE_LIMIT` | `30` | 每个客户端 IP 每窗口内 `/api/*` 最多请求次数；`0` = 关闭（auth 端点不计入，走独立限流） |
 | `API_RATE_WINDOW_MIN` | `10` | 限流窗口（分钟） |
 | `TRUST_PROXY` | `0` | `1` = 在可信反向代理（Nginx/Caddy）后用 `X-Forwarded-For` 首个 IP 作为客户端 IP；直接对外暴露时保持 `0` |
+| `DATA_DIR` | `./.data/app.db` | SQLite 数据库文件路径（Docker 镜像内默认 `/data/app.db`，务必持久化该卷） |
+| `SMTP_HOST` / `SMTP_PORT` | 空 / `465` | 验证码邮件服务器（465 隐式 TLS）。留空则无法注册登录 |
+| `SMTP_USER` / `SMTP_PASS` | 空 | 发信账号与**授权码**（QQ/163 不是登录密码！QQ 强制 MAIL FROM=SMTP_USER） |
+| `MAIL_FROM_NAME` | `每日营养管家` | 发件人显示名 |
+| `AUTH_DEV_LOG_CODE` | 关 | **仅本地调试**：置 `1` 时把验证码打到服务端日志，免收邮件即可联调；生产务必关闭 |
 
 ### 三种启动方式
 
@@ -90,7 +96,7 @@ HOST=127.0.0.1 PORT=8080 npm start
 
 ### Docker
 
-镜像基于 `node:20-alpine`，以非 root 用户 `node` 运行，内置 `HEALTHCHECK`（访问 `/api/health`）。`.env` 已被 `.dockerignore` 排除，**Key 通过运行时注入**。
+镜像基于 `node:24-alpine`（内置 `node:sqlite`），以非 root 用户 `node` 运行，内置 `HEALTHCHECK`（访问 `/api/health`）。`.env` 已被 `.dockerignore` 排除，**Key 与授权码通过运行时注入**；账号数据在容器 `/data/app.db`，用命名卷持久化。
 
 ```bash
 docker build -t nutrition-tracker .
@@ -98,26 +104,29 @@ docker build -t nutrition-tracker .
 # 方式一：直接注入 Key（最常用）
 docker run -d --name nutrition-tracker \
   -p 8080:8080 \
+  -v nutrition-data:/data \
   -e KIMI_API_KEY=sk-你的Key \
   nutrition-tracker
 
 # 方式二：使用本机 .env 文件（推荐，避免 Key 留在 shell history）
 docker run -d --name nutrition-tracker \
   -p 8080:8080 \
+  -v nutrition-data:/data \
   --env-file .env \
   nutrition-tracker
 
 # 可选：调大/关闭限流、开启 TRUST_PROXY、换模型
 docker run -d --name nutrition-tracker -p 8080:8080 --env-file .env \
+  -v nutrition-data:/data \
   -e API_RATE_LIMIT=60 -e API_RATE_WINDOW_MIN=10 -e TRUST_PROXY=1 \
   nutrition-tracker
 
 docker logs -f nutrition-tracker      # 查看启动日志与风险提示
 docker inspect --format '{{.State.Health.Status}}' nutrition-tracker
-# docker stop 会发送 SIGTERM：服务端先停止接收新连接，再安全退出
+# docker stop 会发送 SIGTERM：服务端先停止接收新连接，再安全退出（SQLite WAL 自动落盘）
 ```
 
-> 容器内 `HOST=0.0.0.0`、`PORT=8080` 已由 Dockerfile 设置；端口映射请按需修改（如 `-p 9000:8080`）。
+> 容器内 `HOST=0.0.0.0`、`PORT=8080`、`DATA_DIR=/data/app.db` 已由 Dockerfile 设置；端口映射请按需修改（如 `-p 9000:8080`）。删除容器时加 `-v`（命名卷）或 bind mount（`-v $(pwd)/data:/data`）保住账号数据。
 
 ### 反向代理 + HTTPS（公网推荐）
 
@@ -163,14 +172,42 @@ server {
 - **务必开启限流**：`API_RATE_LIMIT` / `API_RATE_WINDOW_MIN` 是每个 IP 的兜底；公网建议先设小一点（如 10 次/10 分钟）再按需放宽。`/api/health` 不计入限流（前端探测与 Docker 健康检查会频繁调用）。
 - **Key 安全**：Key 只存在服务端（`.env` 或环境变量），前端只请求同源 `/api/*`；不要提交 `.env`、不要打到镜像里、不要把 Key 写进前端或 README。泄露后立即在 Kimi 控制台轮换。
 - **只分享地址，不分享 Key**：别人拿到地址即可使用你的服务；若只想自己/家人用，可把 `HOST` 保持 `127.0.0.1` 仅本机访问，或仅在内网 `0.0.0.0` 开放。
-- **建议加一层访问控制**：公网长期运行可考虑在 Nginx/Caddy 上加 Basic Auth、IP 白名单，或前置 Cloudflare Access 之类；本服务自身没有账号体系。
+- **建议加一层访问控制**：v3.6 起 AI 功能已有邮箱账号 + 每日额度门禁；公网长期运行仍建议在 Nginx/Caddy 上加 IP 白名单或前置 Cloudflare Access，并配 HTTPS（配合 Cookie `Secure`）。
 - 服务端响应统一 `Cache-Control: no-store`，并带 `nosniff` / `X-Frame-Options: DENY` / `Referrer-Policy: no-referrer` 等安全头；`.env`、`server.js`、`package.json` 等工程文件不会被静态服务返回。
 
 ### 数据与多设备
 
-- 记录、身体数据、计划、主题全部存在**访问者浏览器 localStorage**，服务端不存任何用户数据、也没有账号系统。
-- 因此：换个浏览器/设备/清空站点数据就看不到原记录；同一地址在不同设备上各自独立。需要迁移时用「个人设置 → 导出/导入」。
-- 分享给别人时，对方看到的是空白数据和同一个 AI 服务（除非他们自带 Key 自建部署）。
+- 记录、身体数据、计划、主题全部存在**访问者浏览器 localStorage**，服务端不存任何用户内容；账号库（SQLite）只存邮箱、验证码哈希、会话哈希与 AI 用量计数。
+- 因此：换个浏览器/设备/清空站点数据就看不到原记录（登录身份跟 Cookie 走，换设备需重新收码验证）；同一地址在不同设备上各自独立。需要迁移时用「个人设置 → 导出/导入」。
+- 分享给别人时，对方看到的是空白数据，注册后消耗你的百炼账号额度（每人每天限 5 次 AI）。
+
+### 账号与 AI 额度（v3.6）
+
+**游客可用范围**：本地食品库、摄入记录、身体数据、目标计划、主题等全部离线功能无需登录；三个 AI 接口（`/api/food-search`、`/api/estimate-photo`、`/api/scan-label`）需要登录，未登录返回 `401 LOGIN_REQUIRED`。
+
+**注册即登录（邮箱验证码）**：输入邮箱 →「获取验证码」→ 邮件收到 6 位数字码（**10 分钟有效**，最多试错 5 次）→ 验证通过自动注册并登录。会话 Cookie `nt_session` 有效期 30 天（HttpOnly + SameSite=Lax）。当前按 http 部署未加 `Secure` 标记；**上 HTTPS 后建议改为 `__Host-nt_session` 或加 `Secure`**。服务端只存验证码的 scrypt 哈希与会话 token 的 sha256，不存明文。
+
+**AI 额度规则**：每个登录会话（≈一台设备/浏览器）**每天 5 次** AI 调用（day 按 UTC+8，次日 0 点自动重置），成功调用才计数（含缓存命中）。用完返回 `429 QUOTA_EXCEEDED` 并带 `retryAfterSec`。换邮箱重新注册**不会**重置额度——额度跟设备走，防止无限注册刷 Key。发码限流：同一邮箱 60 秒一次、每邮箱每天 10 次、每 IP 每小时 20 次。
+
+**SMTP 配置方法（QQ 邮箱示例）**：
+
+1. 登录 [QQ 邮箱网页版] → 设置 → 账户 → 开启 **IMAP/SMTP 服务**，按提示发短信后得到一个 16 位**授权码**（不是 QQ 密码！）；
+2. `.env` 填入：`SMTP_HOST=smtp.qq.com`、`SMTP_PORT=465`、`SMTP_USER=你的QQ邮箱`、`SMTP_PASS=授权码`、`MAIL_FROM_NAME=每日营养管家`；
+3. 重启服务，启动日志出现 `[auth] 邮箱验证码登录已启用` 即可。**授权码等同密码，切勿提交 `.env`、打进镜像或写进前端**。
+4. 未配置 SMTP 时 `/api/auth/request-code` 返回 503，AI 对所有人关闭（401），其余本地功能不受影响。
+5. 本地联调不想收邮件：设 `AUTH_DEV_LOG_CODE=1`，验证码会打到服务端日志（生产务必关闭）。
+
+**存储**：SQLite（`node:sqlite`，零依赖）文件 `DATA_DIR`，默认 `./.data/app.db`（已在 `.gitignore` 加 `.data/`；`.dockerignore` 排除防误打包）。表：`users / sessions / codes / ai_usage`，服务端每日自动清理过期验证码与会话。备份/迁移只需拷走这个文件（停机或用 WAL 快照）。
+
+**API 契约摘要**（前端对接用，错误统一 `{ok:false,message}`，部分带 `code`）：
+
+| 端点 | 方法 | 请求 | 成功响应 |
+|---|---|---|---|
+| `/api/auth/request-code` | POST | `{email}` | `{ok:true,expiresInSec:600}` |
+| `/api/auth/verify` | POST | `{email,code}` | `{ok:true,user:{email,quota:{remaining,total,usedToday}}}` + Set-Cookie |
+| `/api/auth/me` | GET | Cookie | 同上 user 结构；未登录 `401 code:'NOT_LOGGED_IN'` |
+| `/api/auth/logout` | POST | Cookie | `{ok:true}` + 过期 Cookie |
+| AI 三端点 | POST | 原有参数 | 原响应额外带 `quota` 对象与 `X-AI-Quota-Remaining` 头 |
 
 ### 移动端
 
@@ -180,10 +217,11 @@ server {
 
 - Key 只放在服务器 `.env` / 环境变量的 `KIMI_API_KEY`，前端只请求同源 `/api/*`，源码与网络请求中都不含 Key。
 - 端点：
-  - `GET /api/health`：返回 `host`、`port`、`textModel`、`visionModel`、`models`（实际生效的文本/视觉模型）、`maxTokens`（输出预算）、`rpm`、`rateLimit`（limit/windowMin/trustProxy）、`hasApiKey`、`queue`、`uptimeSec`，便于部署排查。
-  - `POST /api/food-search`：`{query}` → AI 返回最多 4 条食品（每 100g 营养、类别、每份重量、置信说明）。
-  - `POST /api/estimate-photo`：`{image, reference, description, cookMethod, hints}` → 识别食物并返回重量/热量区间、宏量营养素、不确定性说明。
-  - `POST /api/scan-label`：`{image}` → 识别包装营养成分表照片，返回 `{productName, brand, netContentGrams, basis, per100:{energyKj,kcal,protein,fat,saturatedFat,carbs,sugar,fiber,sodiumMg}, ingredients, warnings}`；前端预填核对表单，保存由用户确认。
+  - `GET /api/health`：返回 `host`、`port`、`textModel`、`visionModel`、`models`（实际生效的文本/视觉模型）、`maxTokens`（输出预算）、`rpm`、`rateLimit`（limit/windowMin/trustProxy）、`hasApiKey`、`queue`、`authEnabled`、`mailProvider`（SMTP 摘要，不含密钥）、`aiQuota`（perDay/scope/timezone/storage）、`uptimeSec`，便于部署排查。
+  - `POST /api/food-search`：**需登录**。`{query}` → AI 返回最多 4 条食品（每 100g 营养、类别、每份重量、置信说明）。
+  - `POST /api/estimate-photo`：**需登录**。`{image, reference, description, cookMethod, hints}` → 识别食物并返回重量/热量区间、宏量营养素、不确定性说明。
+  - `POST /api/scan-label`：**需登录**。`{image}` → 识别包装营养成分表照片，返回 `{productName, brand, netContentGrams, basis, per100:{energyKj,kcal,protein,fat,saturatedFat,carbs,sugar,fiber,sodiumMg}, ingredients, warnings}`；前端预填核对表单，保存由用户确认。
+  - 账号端点见上文「账号与 AI 额度」契约表。
 - 模型：文本 `qwen3.7-flash`（阿里云百炼），视觉 `qwen3-vl-plus`。**文本模型带 reasoning**，会占用 `max_tokens`，因此输出预算必须覆盖思考：食品查询首次给 4000 tokens，若 `finish_reason=length` 导致 JSON 被截断，会自动用 5000 tokens 重试一次，仍失败才返回「AI 输出被截断」。视觉 `qwen3-vl-plus` 实测稳定，1600 tokens 足够。
 - 账号限制约 **3 次/分钟**：后端做串行队列（约 20 秒一次）与 30 分钟搜索缓存；界面会显示“AI 搜索中/排队”，失败会给出明确提示。
 - 上游 `KIMI_BASE_URL` 支持 `http://`/`https://`（便于接自建代理或本地 mock）；上游返回 401/403 时前端会看到“服务端 AI Key 无效或权限不足（请检查 KIMI_API_KEY）”，模型名不可用时提示检查模型配置。
@@ -234,12 +272,13 @@ server {
 | `assets/icons/` | PWA 图标（192/512/maskable/apple-touch） |
 | `manifest.webmanifest` / `sw.js` | PWA 安装清单与 Service Worker（离线缓存） |
 | `render.yaml` / `docker-compose.yml` | 一键部署（Render 免费档 / 自建 Docker） |
-| `server.js` | 静态服务 + Kimi 代理 + 限流 + 优雅关闭（Key 只在服务端） |
+| `server.js` | 静态服务 + AI 代理 + 邮箱验证码登录/AI 额度（SQLite）+ SMTP 发信 + 限流 + 优雅关闭（Key 只在服务端） |
 | `package.json` | 工程元信息与 `npm start` / `npm test` 脚本（零依赖） |
 | `start-server.cmd` / `stop-server.cmd` | Windows 一键启动 / 停止后端（双击运行） |
-| `Dockerfile` / `.dockerignore` | 自托管镜像（node:20-alpine、非 root、HEALTHCHECK） |
-| `.env` | 本机密钥（**不要分享/提交/打进镜像**） |
-| `.env.example` | 配置模板（含 HOST / 限流 / TRUST_PROXY 说明） |
+| `Dockerfile` / `.dockerignore` | 自托管镜像（node:24-alpine、非 root、HEALTHCHECK、/data 卷） |
+| `.env` | 本机密钥与 SMTP 授权码（**不要分享/提交/打进镜像**） |
+| `.env.example` | 配置模板（含 HOST / 限流 / TRUST_PROXY / SMTP / DATA_DIR 说明） |
+| `.data/app.db` | 本地 SQLite（账号/会话/验证码/AI 用量），勿提交；容器内对应 `/data/app.db` |
 | `test-harness.cjs` | 核心逻辑测试（`npm test`） |
 
 ## 测试
@@ -258,5 +297,5 @@ npm test           # 等价于 node test-harness.cjs
 - 视觉识别受拍摄角度、遮挡、参照物与厚度影响，输出一定是区间，不应视为精确测量；AI 只会把参照物名称作为提示，无法真正按像素标定尺寸。
 - 体脂率为公式估算值（美国海军公式），个体差异大；围度测量误差会明显影响结果。
 - AI 营养数据为估算/参考，品牌商品请以包装标签为准。
-- 无用户系统与多设备同步；数据在单浏览器 localStorage，清空浏览器数据会丢失，请用导出/导入备份。
+- 无用户内容与多设备同步：记录在单浏览器 localStorage，清空浏览器数据会丢失，请用导出/导入备份；账号系统仅用于 AI 门禁与额度（服务端只存邮箱与哈希）。
 - 本工具不构成医疗或营养学建议。
