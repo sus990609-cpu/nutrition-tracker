@@ -458,5 +458,30 @@ check("PWA Service Worker 存在且包含缓存与离线回退", (() => {
 check("PWA 图标文件齐全", ["assets/icons/icon-192.png", "assets/icons/icon-512.png", "assets/icons/maskable-512.png", "assets/icons/apple-touch-icon-180.png"]
   .every(p => fs.existsSync(p)));
 
+/* ---------- v3.5：拍照识别营养成分表（AI 预填 + 用户确认） ---------- */
+const labelFixture = {
+  productName: "欣善怡谷物即食麦片 (优粹麦)", brand: "欣善怡", netContentGrams: 1400, basis: "100g",
+  per100: { energyKj: 1460, kcal: 349, protein: 12.3, fat: 1.3, saturatedFat: 0.3, carbs: 65.7, sugar: 1.7, fiber: 10.7, sodiumMg: 270 },
+  ingredients: ["全麦小麦 99%", "食用盐"], warnings: []
+};
+const lp = ctx.labelToParsed(labelFixture);
+check("标签识别 → 表单结构正确（名称/品牌/净含量/基准）",
+  lp.ok && lp.aiSource === true && lp.data.name === "欣善怡谷物即食麦片 (优粹麦)" && lp.data.brand === "欣善怡" && lp.data.netGrams === 1400 && lp.data.basis === "100g");
+check("标签识别 → 营养数值映射（kcal/蛋白/碳水/脂肪/钠）",
+  lp.data.nutrition.calories === 349 && lp.data.nutrition.protein === 12.3 && lp.data.nutrition.carbs === 65.7 && lp.data.nutrition.fat === 1.3 && lp.data.nutrition.sodium === 270,
+  JSON.stringify(lp.data.nutrition));
+check("标签识别 → 配料保留、类别自动判定", Array.isArray(lp.data.ingredients) && lp.data.ingredients.length === 2 && lp.data.category === "主食", lp.data.category);
+const lpMiss = ctx.labelToParsed({ productName: "某面包", per100: { kcal: null, protein: 8, carbs: 40, fat: null } });
+check("缺失字段生成核对提醒，不编造数值",
+  lpMiss.warnings.some(w => w.includes("能量")) && lpMiss.warnings.some(w => w.includes("脂肪")) && lpMiss.data.nutrition.calories === null && lpMiss.data.nutrition.fat === null,
+  JSON.stringify(lpMiss.warnings));
+const lpServing = ctx.labelToParsed({ productName: "x", basis: "serving", per100: { kcal: 100, protein: 1, carbs: 10, fat: 1 } });
+check("每份基准提示换算风险", lpServing.warnings.some(w => w.includes("每份")));
+ctx.renderParsedForm(lp);
+check("renderParsedForm 显示 AI 来源提示与预填值", (() => {
+  const html = doc.querySelector("#parsedPanel").innerHTML;
+  return html.includes("AI 对包装照片的识别") && html.includes("欣善怡") && html.includes('value="1400"');
+})(), "");
+
 console.log(`\n结果: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
