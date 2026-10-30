@@ -483,5 +483,72 @@ check("renderParsedForm 显示 AI 来源提示与预填值", (() => {
   return html.includes("AI 对包装照片的识别") && html.includes("欣善怡") && html.includes('value="1400"');
 })(), "");
 
+/* ---------- v3.6：账号 / AI 门禁纯函数 ---------- */
+// normalizeEmail：trim + 小写 + 格式校验
+const ne1 = ctx.normalizeEmail("  Alice@Example.COM ");
+check("normalizeEmail 去空格并转小写", ne1.ok && ne1.email === "alice@example.com", JSON.stringify(ne1));
+check("normalizeEmail 空输入报「请输入邮箱」", !ctx.normalizeEmail("").ok && ctx.normalizeEmail("").message.includes("请输入"));
+check("normalizeEmail 缺 @ 判为格式不正确", !ctx.normalizeEmail("foo").ok && ctx.normalizeEmail("foo").message.includes("格式"));
+check("normalizeEmail 缺顶级域判为格式不正确", !ctx.normalizeEmail("a@b").ok, ctx.normalizeEmail("a@b").message);
+check("normalizeEmail 接受带子域名地址", ctx.normalizeEmail("x@sub.example.co").ok);
+
+// emailPrefix：取 @ 前缀用于顶栏展示
+check("emailPrefix 取 @ 前缀", ctx.emailPrefix("alice@example.com") === "alice");
+check("emailPrefix 无 @ 回退整串", ctx.emailPrefix("bob") === "bob");
+check("emailPrefix 空串返回空", ctx.emailPrefix("") === "");
+
+// formatQuotaText：兼容 remaining/total/usedToday，绝不显示 undefined
+check("formatQuotaText 正常 3/5", ctx.formatQuotaText({ remaining: 3, total: 5 }) === "今日剩余 3/5", ctx.formatQuotaText({ remaining: 3, total: 5 }));
+check("formatQuotaText 用 usedToday 推算（5-2=3）", ctx.formatQuotaText({ usedToday: 2, total: 5 }) === "今日剩余 3/5", ctx.formatQuotaText({ usedToday: 2, total: 5 }));
+check("formatQuotaText 缺字段默认 5/5", ctx.formatQuotaText(null) === "今日剩余 5/5", ctx.formatQuotaText(null));
+check("formatQuotaText remaining 超 total 被夹到上限", ctx.formatQuotaText({ remaining: 9, total: 5 }) === "今日剩余 5/5");
+check("formatQuotaText remaining 负数被夹到 0", ctx.formatQuotaText({ remaining: -2, total: 5 }) === "今日剩余 0/5");
+
+// formatRetryAfter：秒 → 人类可读恢复时间
+check("formatRetryAfter 45 秒", ctx.formatRetryAfter(45) === "约 45 秒后", ctx.formatRetryAfter(45));
+check("formatRetryAfter 120 秒 → 2 分钟", ctx.formatRetryAfter(120) === "约 2 分钟后", ctx.formatRetryAfter(120));
+check("formatRetryAfter 90 秒向上取整为 2 分钟", ctx.formatRetryAfter(90) === "约 2 分钟后", ctx.formatRetryAfter(90));
+check("formatRetryAfter 3600 秒 → 1 小时", ctx.formatRetryAfter(3600) === "约 1 小时后", ctx.formatRetryAfter(3600));
+check("formatRetryAfter 非法值返回空串", ctx.formatRetryAfter(undefined) === "" && ctx.formatRetryAfter(0) === "");
+
+// classifyAuthError：按 code 优先、status 兜底分类
+check("classifyAuthError LOGIN_REQUIRED → login_required", ctx.classifyAuthError({ code: "LOGIN_REQUIRED" }) === "login_required");
+check("classifyAuthError QUOTA_EXCEEDED → quota_exceeded", ctx.classifyAuthError({ code: "QUOTA_EXCEEDED" }) === "quota_exceeded");
+check("classifyAuthError NOT_LOGGED_IN → not_logged_in", ctx.classifyAuthError({ code: "NOT_LOGGED_IN" }) === "not_logged_in");
+check("classifyAuthError 无 code 时 status 401 兜底 login_required", ctx.classifyAuthError({ status: 401 }) === "login_required");
+check("classifyAuthError 无 code 时 status 429 兜底 quota_exceeded", ctx.classifyAuthError({ status: 429 }) === "quota_exceeded");
+check("classifyAuthError 其它错误归为 other", ctx.classifyAuthError({ status: 500, message: "boom" }) === "other");
+check("classifyAuthError null 归为 other", ctx.classifyAuthError(null) === "other");
+
+// parseAuthUser：容错解析后端 user 对象
+check("parseAuthUser 正常解析 email+quota", (() => {
+  const u = ctx.parseAuthUser({ ok: true, user: { email: "a@b.com", quota: { remaining: 4, total: 5 } } });
+  return u && u.email === "a@b.com" && u.quota.remaining === 4;
+})());
+check("parseAuthUser 未登录（ok:false）返回 null", ctx.parseAuthUser({ ok: false }) === null);
+check("parseAuthUser 缺 email 返回 null", ctx.parseAuthUser({ ok: true, user: { quota: {} } }) === null);
+
+// gateLoginHtml / gateQuotaHtml：门禁提示文案（含 esc 转义，防 XSS）
+check("gateLoginHtml 含「需注册登录」且转义尖括号", (() => {
+  const h = ctx.gateLoginHtml();
+  return h.includes("需注册登录") && h.includes("error-text");
+})(), ctx.gateLoginHtml());
+check("gateQuotaHtml 组合服务端 message 与恢复时间", (() => {
+  const h = ctx.gateQuotaHtml({ message: "今日额度已用完", retryAfterSec: 120 });
+  return h.includes("今日额度已用完") && h.includes("约 2 分钟后");
+})(), ctx.gateQuotaHtml({ message: "今日额度已用完", retryAfterSec: 120 }));
+check("gateQuotaHtml 对 message 做 HTML 转义（防 XSS）", (() => {
+  const h = ctx.gateQuotaHtml({ message: "<script>x</script>", retryAfterSec: 0 });
+  return !h.includes("<script>") && h.includes("&lt;script&gt;");
+})(), ctx.gateQuotaHtml({ message: "<script>x</script>", retryAfterSec: 0 }));
+
+// quotaBadgeHtml：游客不显示，登录后显示剩余次数
+check("quotaBadgeHtml 游客态返回空串", (() => { ctx.applyAuthUser(null); return ctx.quotaBadgeHtml() === ""; })());
+check("quotaBadgeHtml 登录后显示「今日剩余」", (() => {
+  ctx.applyAuthUser({ email: "a@b.com", quota: { remaining: 2, total: 5 } });
+  return ctx.quotaBadgeHtml().includes("今日剩余 2/5");
+})(), ctx.quotaBadgeHtml());
+ctx.applyAuthUser(null); // 复位为游客，避免影响后续
+
 console.log(`\n结果: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
