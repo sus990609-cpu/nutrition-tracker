@@ -10,10 +10,22 @@ services:
       HOST: 0.0.0.0
       PORT: "8080"
       TRUST_PROXY: "1"
+      # SQLite（账号/会话/验证码/AI 用量）落在命名卷里，容器重建不丢数据
+      DATA_DIR: /data/app.db
+      # SMTP 真实值写在 .env（勿提交）；这里只留占位便于排查配置是否注入成功
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: "${SMTP_PORT:-465}"
+      SMTP_USER: ${SMTP_USER:-}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-每日营养管家}
     env_file:
       - .env
+    volumes:
+      - app-data:/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  app-data:
