@@ -543,6 +543,8 @@ async function fetchJson(url, options = {}, timeout = 130000) {
     if (!res.ok || !data || data.ok === false) {
       const err = new Error((data && data.message) || `AI 服务错误（${res.status}）`);
       err.status = res.status;
+      // 透出服务端业务码（LOGIN_REQUIRED / QUOTA_EXCEEDED / NOT_LOGGED_IN），供前端门禁分支使用
+      if (data && data.code != null) err.code = data.code;
       if (data && data.retryAfterSec != null) err.retryAfterSec = data.retryAfterSec;
       throw err;
     }
@@ -582,6 +584,8 @@ async function checkApi() {
     apiState.ready = true;
     apiState.health = h;
     setApiStatus(true, `AI 已连接：文本 ${h.textModel} / 视觉 ${h.visionModel} · 约 ${h.rpm} 次/分钟`);
+    // 并行刷新登录态（不阻塞健康检查返回；失败按游客处理）
+    loadAuthMe();
     return true;
   } catch (e) {
     apiState.ready = false;
@@ -638,6 +642,411 @@ async function aiScanLabel(image) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ image })
   });
+}
+
+/* ================= v3.6 账号 / AI 门禁（配合后端 /api/auth/*） ================= */
+
+// 登录态：user=null 表示游客；quota 来自后端 user.quota
+const authState = { checked: false, user: null };
+
+/**
+ * 规范化邮箱并校验格式（纯函数，便于测试）。
+ * 返回 { ok, email, message }；email 为 trim + 转小写后的值。
+ */
+function normalizeEmail(raw) {
+  const email = String(raw ?? "").trim().toLowerCase();
+  if (!email) return { ok: false, email: "", message: "请输入邮箱地址" };
+  // 宽松校验：本地部分@域名.顶级域，避免误伤合法地址
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { ok: false, email, message: "邮箱格式不正确，请检查后重试" };
+  }
+  return { ok: true, email, message: "" };
+}
+
+/**
+ * 把 fetchJson 抛出的错误分类为账号门禁类型（纯函数，便于测试）。
+ * 返回 "login_required" | "quota_exceeded" | "not_logged_in" | "other"。
+ * 优先用 err.code，缺失时按 status 兜底。
+ */
+function classifyAuthError(err) {
+  if (!err) return "other";
+  const code = err.code;
+  if (code === "LOGIN_REQUIRED") return "login_required";
+  if (code === "QUOTA_EXCEEDED") return "quota_exceeded";
+  if (code === "NOT_LOGGED_IN") return "not_logged_in";
+  const st = num(err.status);
+  if (st === 401) return "login_required";
+  if (st === 429) return "quota_exceeded";
+  return "other";
+}
+
+/** 取邮箱「@」前的前缀用于顶栏展示（纯函数）；无 @ 时回退整串。 */
+function emailPrefix(email) {
+  const s = String(email ?? "").trim();
+  if (!s) return "";
+  const at = s.indexOf("@");
+  return at > 0 ? s.slice(0, at) : s;
+}
+
+/**
+ * 把服务端 quota 对象格式化为中文文案（纯函数）。
+ * 兼容 remaining/total/usedToday；缺字段时用合理默认，绝不显示 undefined。
+ */
+function formatQuotaText(quota) {
+  const q = quota || {};
+  const total = Number.isFinite(num(q.total)) && num(q.total) > 0 ? num(q.total) : 5;
+  let remaining = num(q.remaining);
+  if (!Number.isFinite(q.remaining) || q.remaining == null) remaining = total - num(q.usedToday);
+  remaining = Math.max(0, Math.min(total, remaining));
+  return `今日剩余 ${remaining}/${total}`;
+}
+
+/**
+ * 把 retryAfterSec 换算成人类可读的恢复时间（纯函数）。
+ * <60s → 「约 N 秒后」；否则分钟；再大加小时。非法值返回空串。
+ */
+function formatRetryAfter(sec) {
+  const n = Math.max(0, Math.round(num(sec)));
+  if (!n) return "";
+  if (n < 60) return `约 ${n} 秒后`;
+  if (n < 3600) {
+    const m = Math.ceil(n / 60);
+    return `约 ${m} 分钟后`;
+  }
+  const h = Math.floor(n / 3600);
+  const m = Math.ceil((n % 3600) / 60);
+  return m > 0 ? `约 ${h} 小时 ${m} 分钟后` : `约 ${h} 小时后`;
+}
+
+/**
+ * 从后端响应解析登录用户对象（纯函数，容错）。
+ * 期望 data.user:{email,quota}；无 email 视为未登录返回 null。
+ */
+function parseAuthUser(data) {
+  if (!data || !data.ok || !data.user) return null;
+  const email = String(data.user.email ?? "").trim();
+  if (!email) return null;
+  return { email, quota: data.user.quota || null };
+}
+
+/** 应用登录态并刷新顶栏（body 类供弹窗滚动锁定用）。 */
+function applyAuthUser(user) {
+  authState.checked = true;
+  authState.user = user || null;
+  renderAccountEntry();
+  if (typeof document !== "undefined" && document.body && document.body.classList) {
+    document.body.classList.toggle("auth-modal-open", !!$("#authModal") && !$("#authModal").hidden);
+  }
+}
+
+async function loadAuthMe() {
+  try {
+    const data = await fetchJson(apiUrl("auth/me"), { method: "GET" }, 8000);
+    applyAuthUser(parseAuthUser(data));
+  } catch (e) {
+    // 未登录 / 网络失败都按游客处理，不影响任何本地功能
+    applyAuthUser(null);
+  }
+  return authState.user;
+}
+
+async function doLogout() {
+  try { await fetchJson(apiUrl("auth/logout"), { method: "POST" }); } catch (e) { /* 忽略：本地一律清除登录态 */ }
+  applyAuthUser(null);
+}
+
+/* ---------- AI 门禁：结果区提示（纯 UI，读取已分类的错误） ---------- */
+
+/** 生成「需要登录」提示 HTML（esc 转义），并打开登录弹窗。 */
+function gateLoginHtml(msg) {
+  return `<p class="error-text">${esc(msg || "AI 功能需注册登录（每天赠送 5 次额度）")}</p><p class="hint">本地记录、搜索、计划等功能不受影响。</p>`;
+}
+
+/** 生成「额度用尽」提示 HTML：服务端 message + retryAfterSec 换算的恢复时间。 */
+function gateQuotaHtml(err) {
+  const when = formatRetryAfter(err && err.retryAfterSec);
+  const serverMsg = (err && err.message) ? String(err.message) : "今日 AI 额度已用完";
+  const tail = when ? `（${when}可再次使用）` : "";
+  return `<p class="error-text">${esc(serverMsg)}${esc(tail)}</p><p class="hint">额度按邮箱账号计算，明天会自动重置；也可切换其他账号。</p>`;
+}
+
+/** 结果区成功后的剩余次数徽标行（有 user 才显示）。 */
+function quotaBadgeHtml() {
+  if (!authState.user) return "";
+  return `<p class="hint quota-remaining">🎯 ${esc(formatQuotaText(authState.user.quota))}</p>`;
+}
+
+/**
+ * AI 调用成功后同步剩余额度：若响应体带 quota 直接采纳，否则异步拉 /auth/me。
+ * （后端最终是否在 AI 响应里回传 quota 尚未定，两种都兼容。）
+ */
+async function adoptQuota(data) {
+  if (data && data.quota && authState.user) {
+    applyAuthUser({ email: authState.user.email, quota: data.quota });
+    return;
+  }
+  if (authState.user) loadAuthMe();
+}
+
+/**
+ * 统一处理一次 AI 调用抛出的异常：命中门禁则渲染对应提示并返回 true（已处理）。
+ * box 为结果容器；返回 false 表示非门禁错误，交给调用方原有兜底逻辑。
+ */
+function handleAiGateError(box, err) {
+  const kind = classifyAuthError(err);
+  if (kind === "login_required" || kind === "not_logged_in") {
+    if (box) box.innerHTML = gateLoginHtml();
+    applyAuthUser(null);
+    openAuthModal("AI 功能需注册登录（送每天 5 次），登录后即可使用。");
+    return true;
+  }
+  if (kind === "quota_exceeded") {
+    if (box) box.innerHTML = gateQuotaHtml(err);
+    return true;
+  }
+  return false;
+}
+
+/* ---------- 顶栏账户入口（未登录「登录」/已登录邮箱前缀 + 下拉菜单） ---------- */
+
+let accountMenuOpen = false;
+
+/** 根据 authState 渲染顶栏账户按钮与下拉菜单内容。 */
+function renderAccountEntry() {
+  const btn = $("#accountBtn");
+  if (!btn) return;
+  const user = authState.user;
+  const label = $("#accountLabel");
+  const menu = $("#accountMenu");
+  if (user) {
+    btn.classList.add("logged-in");
+    if (label) label.textContent = emailPrefix(user.email);
+    btn.setAttribute("aria-label", `已登录：${user.email}`);
+    if (menu) {
+      menu.innerHTML = `
+        <div class="account-menu-head">
+          <span class="account-email">${esc(user.email)}</span>
+          <span class="account-quota">${esc(formatQuotaText(user.quota))}</span>
+        </div>
+        <button type="button" class="account-menu-item" id="accountLogoutBtn">退出登录</button>`;
+      const lo = $("#accountLogoutBtn");
+      if (lo && typeof lo.addEventListener === "function") lo.addEventListener("click", () => { closeAccountMenu(); doLogout(); });
+    }
+  } else {
+    btn.classList.remove("logged-in");
+    if (label) label.textContent = "登录";
+    btn.setAttribute("aria-label", "登录 / 注册");
+    if (menu) menu.innerHTML = "";
+    closeAccountMenu();
+  }
+}
+
+function openAccountMenu() {
+  const wrap = $("#accountWrap");
+  const btn = $("#accountBtn");
+  if (!wrap || !authState.user) return;
+  accountMenuOpen = true;
+  wrap.classList.add("open");
+  if (btn) btn.setAttribute("aria-expanded", "true");
+}
+
+function closeAccountMenu() {
+  const wrap = $("#accountWrap");
+  const btn = $("#accountBtn");
+  accountMenuOpen = false;
+  if (wrap) wrap.classList.remove("open");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+function toggleAccountMenu() {
+  if (accountMenuOpen) closeAccountMenu(); else openAccountMenu();
+}
+
+function bindAccountEntry() {
+  const btn = $("#accountBtn");
+  if (!btn || typeof btn.addEventListener !== "function") return;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (authState.user) toggleAccountMenu();
+    else openAuthModal("");
+  });
+  // 点击页面其它处关闭下拉
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("click", (e) => {
+      if (!accountMenuOpen) return;
+      const wrap = $("#accountWrap");
+      if (wrap && e.target && typeof e.target.closest === "function" && e.target.closest("#accountWrap")) return;
+      closeAccountMenu();
+    });
+  }
+  renderAccountEntry();
+}
+
+/* ---------- 登录弹窗（手写 modal：邮箱 → 验证码倒计时 → 验证成功自动关闭） ---------- */
+
+let codeTimer = null;
+let lastFocusedBeforeModal = null;
+
+function setCodeCountdown(btn, secs) {
+  if (!btn) return;
+  if (secs > 0) {
+    btn.disabled = true;
+    btn.classList.add("counting");
+    btn.textContent = `重新获取 ${secs}s`;
+  } else {
+    btn.disabled = false;
+    btn.classList.remove("counting");
+    btn.textContent = "获取验证码";
+  }
+}
+
+function stopCodeCountdown() {
+  if (codeTimer) { clearInterval(codeTimer); codeTimer = null; }
+}
+
+function startCodeCountdown(btn, total) {
+  stopCodeCountdown();
+  let secs = num(total) > 0 ? Math.round(num(total)) : 60;
+  setCodeCountdown(btn, secs);
+  codeTimer = setInterval(() => {
+    secs--;
+    if (secs <= 0) { stopCodeCountdown(); setCodeCountdown(btn, 0); }
+    else setCodeCountdown(btn, secs);
+  }, 1000);
+}
+
+function setAuthError(msg) {
+  const el = $("#authError");
+  if (!el) return;
+  if (msg) { el.textContent = msg; el.hidden = false; }
+  else { el.textContent = ""; el.hidden = true; }
+}
+
+function setAuthNotice(msg) {
+  const el = $("#authNotice");
+  if (!el) return;
+  if (msg) { el.textContent = msg; el.hidden = false; }
+  else { el.textContent = ""; el.hidden = true; }
+}
+
+function openAuthModal(intro) {
+  const modal = $("#authModal");
+  if (!modal) return;
+  lastFocusedBeforeModal = (typeof document !== "undefined" && document.activeElement) ? document.activeElement : null;
+  modal.hidden = false;
+  if (typeof document !== "undefined" && document.body && document.body.classList) document.body.classList.add("auth-modal-open");
+  setAuthError("");
+  setAuthNotice(intro || "");
+  const emailEl = $("#authEmail");
+  const codeEl = $("#authCode");
+  if (codeEl) codeEl.value = "";
+  if (emailEl && typeof emailEl.focus === "function") setTimeout(() => { try { emailEl.focus(); } catch (e) {} }, 30);
+}
+
+function closeAuthModal() {
+  const modal = $("#authModal");
+  if (!modal) return;
+  modal.hidden = true;
+  if (typeof document !== "undefined" && document.body && document.body.classList) document.body.classList.remove("auth-modal-open");
+  stopCodeCountdown();
+  setAuthError("");
+  setAuthNotice("");
+  if (lastFocusedBeforeModal && typeof lastFocusedBeforeModal.focus === "function") {
+    try { lastFocusedBeforeModal.focus(); } catch (e) {}
+  }
+  lastFocusedBeforeModal = null;
+}
+
+async function requestLoginCode() {
+  const emailEl = $("#authEmail");
+  const btn = $("#authSendCodeBtn");
+  const raw = emailEl ? emailEl.value : "";
+  const norm = normalizeEmail(raw);
+  if (!norm.ok) { setAuthError(norm.message); return; }
+  if (emailEl) emailEl.value = norm.email;
+  setAuthError("");
+  setBusy(btn, true, "发送中…");
+  try {
+    const data = await fetchJson(apiUrl("auth/request-code"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: norm.email })
+    });
+    setAuthNotice(`验证码已发送到 ${norm.email}，${Math.round(num(data.expiresInSec) / 60 || 10)} 分钟内有效，请查收`);
+    const codeEl = $("#authCode");
+    if (codeEl && typeof codeEl.focus === "function") codeEl.focus();
+    startCodeCountdown(btn, data.expiresInSec && num(data.expiresInSec) < 120 ? data.expiresInSec : 60);
+  } catch (e) {
+    setAuthError(e.message || "验证码发送失败，请稍后重试");
+  } finally {
+    // 成功时 startCodeCountdown 已接管按钮文案/禁用态；仅在未进入倒计时时恢复可点
+    if (!codeTimer) setBusy(btn, false);
+  }
+}
+
+async function submitLoginVerify() {
+  const emailEl = $("#authEmail");
+  const codeEl = $("#authCode");
+  const btn = $("#authVerifyBtn");
+  const norm = normalizeEmail(emailEl ? emailEl.value : "");
+  if (!norm.ok) { setAuthError(norm.message); return; }
+  const code = String(codeEl ? codeEl.value : "").trim();
+  if (!/^\d{6}$/.test(code)) { setAuthError("请输入 6 位数字验证码"); return; }
+  setAuthError("");
+  setBusy(btn, true, "验证中…");
+  try {
+    const data = await fetchJson(apiUrl("auth/verify"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: norm.email, code })
+    });
+    const user = parseAuthUser(data);
+    applyAuthUser(user);
+    closeAuthModal();
+  } catch (e) {
+    const kind = classifyAuthError(e);
+    if (kind === "not_logged_in") setAuthError("验证码不正确或已过期，请重新获取");
+    else setAuthError(e.message || "验证失败，请检查邮箱与验证码后重试");
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+function bindAuthModal() {
+  const modal = $("#authModal");
+  if (!modal) return;
+  const sendBtn = $("#authSendCodeBtn");
+  const verifyBtn = $("#authVerifyBtn");
+  const closeBtn = $("#authCloseBtn");
+  if (sendBtn && typeof sendBtn.addEventListener === "function") sendBtn.addEventListener("click", requestLoginCode);
+  if (verifyBtn && typeof verifyBtn.addEventListener === "function") verifyBtn.addEventListener("click", submitLoginVerify);
+  if (closeBtn && typeof closeBtn.addEventListener === "function") closeBtn.addEventListener("click", closeAuthModal);
+  // 遮罩点击关闭
+  modal.addEventListener("click", (e) => { if (e.target === modal) closeAuthModal(); });
+  // Esc 关闭 + 焦点陷阱（Tab 在弹窗内循环）
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("keydown", (e) => {
+      if (modal.hidden) return;
+      if (e.key === "Escape") { closeAuthModal(); return; }
+      if (e.key === "Tab") {
+        const focusables = $$focusable(modal);
+        if (!focusables.length) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement;
+        if (e.shiftKey && (active === first || !modal.contains(active))) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && (active === last || !modal.contains(active))) { e.preventDefault(); first.focus(); }
+      }
+    });
+  }
+}
+
+/** 收集弹窗内可聚焦元素（用于焦点陷阱）。 */
+function $$focusable(root) {
+  if (!root || typeof root.querySelectorAll !== "function") return [];
+  return Array.prototype.slice.call(root.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )).filter(el => !el.hidden);
 }
 
 function setBusy(btn, busy, label) {
@@ -717,15 +1126,18 @@ async function runTrackerAiSearch() {
     if (!(await ensureApiReady(box))) return;
     box.innerHTML = '<p class="hint">AI 正在查询，受每分钟请求限制，可能需要等待…</p>';
     const data = await aiFoodSearch(q);
+    adoptQuota(data);
     renderAiFoodResults(box, data, (item) => {
       const food = aiItemToFood(item);
       state.customFoods.push(food);
       saveState();
       selectFood(food);
-      box.innerHTML = `<p class="hint">已加入食品库并选中「${esc(foodTitle(food))}」，输入食用量即可添加。</p>`;
+      box.innerHTML = `<p class="hint">已加入食品库并选中「${esc(foodTitle(food))}」，输入食用量即可添加。</p>` + quotaBadgeHtml();
     });
   } catch (e) {
-    box.innerHTML = `<p class="error-text">${esc(e.message)}</p><p class="hint">可继续使用本地食品库，或稍后重试。</p>`;
+    if (!handleAiGateError(box, e)) {
+      box.innerHTML = `<p class="error-text">${esc(e.message)}</p><p class="hint">可继续使用本地食品库，或稍后重试。</p>`;
+    }
   } finally {
     setBusy(btn, false);
     updateApiButtons(apiState.ready);
@@ -743,15 +1155,18 @@ async function runFoodsAiSearch() {
     if (!(await ensureApiReady(box))) return;
     box.innerHTML = '<p class="hint">AI 正在查询，受每分钟请求限制，可能需要等待…</p>';
     const data = await aiFoodSearch(q);
+    adoptQuota(data);
     renderAiFoodResults(box, data, (item) => {
       const food = aiItemToFood(item);
       state.customFoods.push(food);
       saveState();
       renderFoodDetail(food);
-      box.innerHTML = `<p class="hint">已加入食品库：「${esc(foodTitle(food))}」。</p>`;
+      box.innerHTML = `<p class="hint">已加入食品库：「${esc(foodTitle(food))}」。</p>` + quotaBadgeHtml();
     });
   } catch (e) {
-    box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+    if (!handleAiGateError(box, e)) {
+      box.innerHTML = `<p class="error-text">${esc(e.message)}</p>`;
+    }
   } finally {
     setBusy(btn, false);
     updateApiButtons(apiState.ready);
@@ -812,9 +1227,12 @@ async function runApiEstimate() {
       hints
     });
     lastApiEstimate = data;
+    adoptQuota(data);
     renderApiEstimateResult(data);
   } catch (e) {
-    box.innerHTML = `<p class="error-text">${esc(e.message)}</p><p class="hint">可补全「补充描述」后重试，或使用本地几何估算。</p>`;
+    if (!handleAiGateError(box, e)) {
+      box.innerHTML = `<p class="error-text">${esc(e.message)}</p><p class="hint">可补全「补充描述」后重试，或使用本地几何估算。</p>`;
+    }
   } finally {
     setBusy(btn, false);
     updateApiButtons(apiState.ready);
@@ -2107,10 +2525,13 @@ async function runTrackerLabelScan(file) {
   try {
     const image = await fileToCompressedDataUrl(file);
     const data = await aiScanLabel(image);
+    adoptQuota(data);
     box.innerHTML = "";
     renderParsedForm(labelToParsed(data));
   } catch (e) {
-    box.innerHTML = `<p class="error-text">${esc(e.message)}</p><p class="hint">请对准「营养成分表」拍清晰些再试，或改用粘贴文本。</p>`;
+    if (!handleAiGateError(box, e)) {
+      box.innerHTML = `<p class="error-text">${esc(e.message)}</p><p class="hint">请对准「营养成分表」拍清晰些再试，或改用粘贴文本。</p>`;
+    }
   } finally {
     setBusy($("#trackerScanBtn"), false);
   }
@@ -3091,6 +3512,8 @@ function init() {
   applyTheme(initialTheme, false);
   bindApiReconnect();
   bindInstallPrompt();
+  bindAccountEntry();
+  bindAuthModal();
   checkApi();
 }
 
