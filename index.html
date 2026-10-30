@@ -13,7 +13,7 @@
   <link rel="apple-touch-icon" href="assets/icons/apple-touch-icon-180.png">
   <link rel="manifest" href="manifest.webmanifest">
   <script>(function(){try{var t=localStorage.getItem("nutritionTheme")||((window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light");document.documentElement.dataset.theme=t;}catch(e){}})();</script>
-  <link rel="stylesheet" href="styles.css?v=20261030d">
+  <link rel="stylesheet" href="styles.css?v=20261030e">
 </head>
 <body>
   <div class="app">
@@ -174,6 +174,18 @@
             <h3>今日记录</h3>
             <div id="trackerEntries"></div>
             <div class="tracker-total" id="trackerTotal"></div>
+            <div class="label-scan">
+              <h4>📷 拍照识别营养成分表</h4>
+              <p class="hint">拍包装背面的营养成分表，AI 自动预填识别结果；核对修改后再保存，确认权在你。</p>
+              <div class="dropzone dropzone-sm" id="trackerDropzone" tabindex="0">
+                <input type="file" id="trackerLabelInput" accept="image/*" capture="environment" hidden>
+                <div class="dropzone-inner"><span class="dropzone-icon">🏷️</span><p>点击拍照 / 拖拽图片到此处</p></div>
+              </div>
+              <div class="btn-row">
+                <button class="btn secondary" id="trackerScanBtn" type="button">✨ AI 识别照片</button>
+              </div>
+              <div id="trackerPanel"></div>
+            </div>
           </div>
         </div>
       </section>
@@ -447,8 +459,8 @@
     </footer>
   </div>
 
-  <script src="catalog.js?v=20261030d"></script>
-  <script src="app.js?v=20261030d"></script>
+  <script src="catalog.js?v=20261030e"></script>
+  <script src="app.js?v=20261030e"></script>
   <script>
   /* PWA：注册 Service Worker（HTTPS 或 localhost 下生效） */
   (function () {
