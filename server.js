@@ -1,10 +1,11 @@
 /**
- * 每日营养管家 - 自托管后端（v3.5.0）
+ * 每日营养管家 - 自托管后端（v3.6.0）
  * - 静态文件服务（带 no-store，避免改完看不到变化）
  * - AI 同源代理：/api/food-search、/api/estimate-photo、/api/scan-label（营养成分表识别）
+ * - 邮箱验证码注册/登录（SMTP 465 隐式 TLS，仅内置模块）+ AI 门禁：未登录 401，登录后每个会话每天 5 次额度
  * - API Key 只从环境变量 / .env 读取，绝不下发到前端
  * - 账号 RPM 限制（默认 3 次/分钟）由串行队列与缓存兜底；另有按客户端 IP 的 /api/* 限流
- * - 零依赖，仅使用 Node.js 内置模块（要求 Node >= 18）
+ * - 零第三方依赖，仅使用 Node.js 内置模块（node:sqlite 需 Node >= 22.5，推荐 24；要求 Node >= 22.5）
  *
  * 环境变量（真实进程环境变量优先于 .env 文件）：
  *   KIMI_API_KEY        必填，Kimi API Key
@@ -17,9 +18,16 @@
  *   AI_MAX_RETRIES      429（账号并发/频率限制）最多尝试次数（含首次，1~10，默认 6）
  *   HOST                监听地址，默认 127.0.0.1（仅本机）；0.0.0.0 表示所有网卡
  *   PORT                监听端口，默认 8080
- *   API_RATE_LIMIT      每个客户端 IP 在窗口内的 /api/* 请求上限，默认 30；0 表示关闭
+ *   API_RATE_LIMIT      每个客户端 IP 在窗口内的 /api/* 请求上限，默认 30；0 表示关闭（auth 端点不计入此限流）
  *   API_RATE_WINDOW_MIN 限流窗口（分钟），默认 10
  *   TRUST_PROXY         1/true 时从 X-Forwarded-For 取真实客户端 IP（仅在可信反向代理后使用）
+ *   DATA_DIR            SQLite 数据库文件路径（默认 ./.data/app.db；Docker 内为 /data/app.db）
+ *   SMTP_HOST           邮件服务器地址（如 smtp.qq.com），未配置时无法发送验证码
+ *   SMTP_PORT           邮件服务器端口（默认 465，隐式 TLS）
+ *   SMTP_USER           发信账号（QQ 邮箱须与 MAIL FROM 一致）
+ *   SMTP_PASS           发信授权码（不是登录密码！切勿提交/打印）
+ *   MAIL_FROM_NAME      发件人显示名（默认「每日营养管家」）
+ *   AUTH_DEV_LOG_CODE   仅本地调试：1 时把验证码打到服务端日志（生产务必关闭）
  */
 "use strict";
 
@@ -28,13 +36,16 @@ const os = require("os");
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const crypto = require("crypto");
+const tls = require("tls");
+const { DatabaseSync } = require("node:sqlite");
 
 const ROOT = __dirname;
 const ROOT_REAL = (() => {
   try { return fs.realpathSync(ROOT); } catch { return ROOT; }
 })();
 // 与 package.json 的 version 保持一致
-const VERSION = "3.5.0";
+const VERSION = "3.6.0";
 
 /* ---------- 配置加载 ---------- */
 function loadEnvFile() {
@@ -110,6 +121,43 @@ const RATE_WINDOW_MIN = Math.max(1, toInt(envValue("API_RATE_WINDOW_MIN", 10), 1
 const RATE_WINDOW_MS = RATE_WINDOW_MIN * 60 * 1000;
 const RATE_MAP_MAX = 10000;
 const TRUST_PROXY = /^(1|true|yes|on)$/i.test(String(envValue("TRUST_PROXY", "") || "").trim());
+
+/* ---------- 账号体系与 AI 额度配置（v3.6） ---------- */
+// 额度按「登录会话」计：同一浏览器换邮箱仍受原设备额度约束，防止无限注册刷 AI 次数。
+// 本地默认 ./.data/app.db；容器内 DATA_DIR=/data/app.db（compose 挂载命名卷 app-data:/data）
+const DB_PATH = (() => {
+  const raw = String(envValue("DATA_DIR", "") || "").trim();
+  if (!raw) return path.join(ROOT, ".data", "app.db");
+  // DATA_DIR 指向目录（无扩展名或以分隔符结尾）时自动补 app.db，方便写 /data 或 /data/
+  if (/[\\/]$/.test(raw)) return path.join(raw, "app.db");
+  const base = path.basename(raw);
+  return base.includes(".") ? raw : path.join(raw, "app.db");
+})();
+
+// 旧版（≤3.5）按 user_id+day 计数，无法区分同账号多设备；v2 迁移后改为按 session 计数
+
+const SMTP_HOST = String(envValue("SMTP_HOST", "") || "").trim();
+const SMTP_PORT = Math.min(65535, Math.max(1, toInt(envValue("SMTP_PORT", 465), 465)));
+const SMTP_USER = String(envValue("SMTP_USER", "") || "").trim();
+const SMTP_PASS = String(envValue("SMTP_PASS", "") || "").trim();
+const MAIL_FROM_NAME = String(envValue("MAIL_FROM_NAME", "每日营养管家") || "").trim() || "每日营养管家";
+// QQ 等服务商强制 MAIL FROM 必须等于登录账号
+const MAIL_FROM = SMTP_USER;
+const AUTH_ENABLED = Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS && MAIL_FROM);
+// 仅本地调试：把验证码写入服务端日志（生产务必关闭）
+const AUTH_DEV_LOG_CODE = /^(1|true|yes|on)$/i.test(String(envValue("AUTH_DEV_LOG_CODE", "") || "").trim());
+
+const SESSION_COOKIE = "nt_session";
+const SESSION_TTL_SEC = 30 * 24 * 3600;        // 30 天
+// AI 额度按「登录会话」计（session_id + day）：一个浏览器一条会话，换邮箱重登也不重置。
+// sessions 表需加 session_id / device_label 两列（见 migrateSchema 的 v2 迁移）。
+// 同一浏览器的并发调用由全局串行队列兜底；跨浏览器同 IP 并发极端情况下可能多放行 1 次，可接受。
+const CODE_TTL_SEC = 600;                       // 验证码 10 分钟
+const CODE_MAX_ATTEMPTS = 5;                    // 每个码最多校验 5 次
+const AI_QUOTA_PER_DAY = 5;                     // 每个登录会话每天 5 次 AI 调用
+const REQ_CODE_PER_EMAIL_COOLDOWN_SEC = 60;     // 同一邮箱 60 秒一次
+const REQ_CODE_PER_EMAIL_PER_DAY = 10;          // 每邮箱每天 10 次
+const REQ_CODE_PER_IP_PER_HOUR = 20;            // 每 IP 每小时 20 次
 
 function resolveBaseUrl(raw) {
   const fallback = "https://api.moonshot.cn/v1";
@@ -283,6 +331,10 @@ function checkRateLimit(req) {
 
 const ratePruneTimer = setInterval(() => pruneRateMap(Date.now(), false), 60 * 1000);
 if (typeof ratePruneTimer.unref === "function") ratePruneTimer.unref();
+
+// 每日清理过期验证码 / 会话 / 历史用量（进程常驻时按 24h 周期；首次执行见 openDb 之后）
+const purgeTimer = setInterval(purgeExpired, 24 * 3600 * 1000);
+if (typeof purgeTimer.unref === "function") purgeTimer.unref();
 
 /* ---------- 上游调用（http/https 自适应；target 可选，缺省为文本上游） ---------- */
 function upstreamPost(payload, target) {
@@ -542,6 +594,642 @@ function normalizeEstimateItems(raw) {
   }).filter(x => x.name);
   const uncertainty = (Array.isArray(raw && raw.uncertainty) ? raw.uncertainty : []).map(x => String(x).slice(0, 160)).slice(0, 6);
   return { items, uncertainty };
+}
+
+/* ---------- 时间工具：day 一律按 UTC+8（Asia/Shanghai 无夏令时） ---------- */
+// 注意：本段必须位于 openDb()/purgeExpired() 调用点之前（const 存在 TDZ）
+const TZ_OFFSET_MS = 8 * 3600 * 1000;
+
+/** 当前「本地日」YYYY-MM-DD（UTC+8），额度按此归零；接受 Date 或毫秒时间戳 */
+function localDay(d) {
+  const t = d instanceof Date ? d : new Date(d === undefined ? Date.now() : d);
+  return new Date(t.getTime() + TZ_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/** 距离下一个 UTC+8 午夜的秒数（QUOTA_EXCEEDED 的 retryAfterSec） */
+function secondsToNextLocalMidnight(nowMs) {
+  const shifted = nowMs + TZ_OFFSET_MS;
+  const msToEndOfDay = 86400000 - (shifted % 86400000);
+  return Math.max(1, Math.ceil(msToEndOfDay / 1000));
+}
+
+/* ---------- 账号体系：SQLite 存储（node:sqlite，零第三方依赖） ---------- */
+let db = null;
+let dbError = null;
+
+const SCHEMA_VERSION = 2;
+
+/** v1：建表；v2：sessions 加 session_id/device_label，ai_usage 改为按会话计数（旧表数据保留为 *_legacy） */
+function migrateSchema(conn) {
+  const row = conn.prepare("PRAGMA user_version").get();
+  let version = Number(row && row.user_version) || 0;
+  if (version >= SCHEMA_VERSION) return version;
+
+  if (version === 0) {
+    conn.exec(`
+      BEGIN;
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        created_at INTEGER NOT NULL,
+        ai_quota INTEGER NOT NULL DEFAULT ${AI_QUOTA_PER_DAY}
+      );
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
+      CREATE TABLE IF NOT EXISTS codes (
+        email TEXT NOT NULL,
+        purpose TEXT NOT NULL CHECK (purpose IN ('register','reset')),
+        code_hash TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (email, purpose)
+      );
+      CREATE TABLE IF NOT EXISTS ai_usage (
+        user_id TEXT NOT NULL,
+        day TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, day, ip)
+      );
+      PRAGMA user_version = 1;
+      COMMIT;
+    `);
+    version = 1;
+  }
+
+  if (version === 1) {
+    // 会话身份：session_id 是配额归属键（随机 id，与 token 解耦，登出重登会换新 id）
+    conn.exec(`
+      BEGIN;
+      ALTER TABLE sessions ADD COLUMN session_id TEXT;
+      ALTER TABLE sessions ADD COLUMN device_label TEXT;
+      UPDATE sessions SET session_id = lower(hex(randomblob(16))) WHERE session_id IS NULL;
+      DROP TABLE IF EXISTS ai_usage_v2;
+      CREATE TABLE ai_usage_v2 (
+        session_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        day TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (session_id, day)
+      );
+      -- 旧版按 user+day+ip 聚合到该用户字典序最小的会话（保守：宁可少给也不放大共享 Key）
+      INSERT INTO ai_usage_v2 (session_id, user_id, day, count)
+        SELECT MIN(s.session_id), u.user_id, u.day, SUM(u.count)
+          FROM ai_usage u JOIN sessions s ON s.user_id = u.user_id
+         WHERE s.session_id IS NOT NULL
+         GROUP BY u.user_id, u.day;
+      DROP TABLE ai_usage;
+      ALTER TABLE ai_usage_v2 RENAME TO ai_usage;
+      CREATE INDEX IF NOT EXISTS idx_ai_usage_day ON ai_usage(day);
+      PRAGMA user_version = 2;
+      COMMIT;
+    `);
+    version = 2;
+  }
+  return version;
+}
+
+function openDb() {
+  try {
+    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+    const conn = new DatabaseSync(DB_PATH);
+    conn.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+    const v = migrateSchema(conn);
+    console.log(`[auth] SQLite 就绪：${DB_PATH}（schema v${v}）`);
+    return conn;
+  } catch (err) {
+    dbError = err;
+    console.error("[auth] 数据库初始化失败：" + err.message);
+    return null;
+  }
+}
+
+db = openDb();
+purgeExpired(); // 启动即清一次过期数据（放在 db 初始化之后，避免 TDZ）
+
+/** 数据库不可用时拒绝所有 auth 与 AI 调用，避免绕过门禁 */
+function requireDb(req, res) {
+  if (db) return true;
+  sendJson(req, res, 503, { ok: false, message: "服务端存储暂不可用，请稍后重试" });
+  return false;
+}
+
+/* ---------- 日志脱敏：邮箱打码、授权码绝不外泄 ---------- */
+function maskEmail(email) {
+  const s = String(email || "");
+  const at = s.indexOf("@");
+  if (at <= 0) return "***";
+  const name = s.slice(0, at);
+  const head = name.slice(0, Math.min(2, name.length));
+  return `${head}${"*".repeat(Math.max(1, name.length - head.length))}${s.slice(at)}`;
+}
+
+/** 任何写入日志/响应的文本都先过一遍：去掉 Key、授权码、完整邮箱 */
+function sanitizeLog(text) {
+  let s = sanitizeUpstream(text);
+  if (SMTP_PASS) s = s.split(SMTP_PASS).join("***");
+  s = s.replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, (m) => maskEmail(m));
+  return s;
+}
+
+/* ---------- 最小 SMTP 客户端（内置 tls，465 隐式 TLS） ---------- */
+/** EHLO → AUTH LOGIN(base64) → MAIL FROM → RCPT TO → DATA → QUIT */
+function smtpSend({ to, subject, text }) {
+  return new Promise((resolve, reject) => {
+    if (!AUTH_ENABLED) {
+      const e = new Error("邮件服务未配置（SMTP_HOST/SMTP_USER/SMTP_PASS）");
+      e.httpStatus = 502;
+      return reject(e);
+    }
+    let settled = false;
+    let stage = "connect";
+    let socket = null;
+    let buffer = "";
+    let deadline = null;
+
+    // 统一清理：撤监听、销毁 socket（socket=null 后 readReply/write 变为无害空操作）
+    const closeSocket = () => {
+      try { if (socket) socket.removeAllListeners(); } catch {}
+      try { if (socket && !socket.destroyed) socket.destroy(); } catch {}
+      socket = null;
+    };
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      deadline = null;
+      closeSocket();
+      fn(value);
+    };
+    const fail = (err) => {
+      const e = err instanceof Error ? err : new Error(String(err));
+      if (e.httpStatus === undefined) {
+        e.httpStatus = 502;
+        e.smtpStage = stage;
+      }
+      settle(reject, e);
+    };
+
+    // 逐行解析 SMTP 回复：中间行 "NNN-..."，终态行 "NNN ..."（QQ 的 EHLO 是多行）
+    const readReply = () => new Promise((res, rej) => {
+      if (!socket) return rej(new Error("SMTP 连接已关闭"));
+      const onData = (chunk) => {
+        buffer += chunk.toString("latin1");
+        let m;
+        while ((m = buffer.match(/^(\d{3})([ -])([^\r\n]*)(\r?\n)/))) {
+          buffer = buffer.slice(m[0].length);
+          if (m[2] === " ") {
+            detach();
+            return res(Number(m[1]));
+          }
+        }
+      };
+      const onError = (err) => { detach(); rej(err); };
+      const onClose = () => { detach(); rej(new Error("SMTP 连接意外关闭")); };
+      const detach = () => {
+        socket.removeListener("data", onData);
+        socket.removeListener("error", onError);
+        socket.removeListener("close", onClose);
+      };
+      socket.on("data", onData);
+      socket.on("error", onError);
+      socket.on("close", onClose);
+    });
+
+    const write = (line) => { socket.write(line + "\r\n"); };
+
+    const run = async () => {
+      const hostname = SMTP_HOST.replace(/^\s*(?:smtp|tls|ssl):\/\//i, "").split("/")[0].trim();
+      stage = "connect";
+      await new Promise((res, rej) => {
+        const onErr = (err) => rej(err);
+        const onTimeout = () => rej(new Error("SMTP 连接超时"));
+        socket = tls.connect({ host: hostname, port: SMTP_PORT, servername: hostname }, () => {
+          socket.removeListener("error", onErr);
+          socket.removeListener("timeout", onTimeout);
+          res();
+        });
+        socket.setTimeout(25000);
+        socket.once("error", onErr);
+        socket.once("timeout", onTimeout);
+      });
+      socket.removeAllListeners("timeout");
+      socket.setTimeout(0);
+      socket.on("error", (err) => fail(err));
+
+      stage = "greeting";
+      const greet = await readReply();
+      if (greet !== 220) throw new Error("SMTP 服务器问候异常（" + greet + "）");
+
+      stage = "ehlo";
+      let ehloHost = "localhost";
+      try { ehloHost = os.hostname() || "localhost"; } catch {}
+      write(`EHLO ${ehloHost}`);
+      const ehloCode = await readReply();
+      if (ehloCode !== 250) throw new Error("SMTP EHLO 被拒绝（" + ehloCode + "）");
+
+      stage = "auth";
+      write("AUTH LOGIN");
+      const authStart = await readReply();
+      if (authStart !== 334) throw new Error("SMTP 未启用 AUTH LOGIN（" + authStart + "）");
+      write(Buffer.from(SMTP_USER, "utf8").toString("base64"));
+      const userOk = await readReply();
+      if (userOk !== 334) throw new Error("SMTP 账号校验异常（" + userOk + "）");
+      write(Buffer.from(SMTP_PASS, "utf8").toString("base64"));
+      const passOk = await readReply();
+      if (passOk !== 235) throw new Error("SMTP 认证失败：请检查 SMTP_PASS 是否为邮箱「授权码」（" + passOk + "）");
+
+      stage = "mail_from";
+      write(`MAIL FROM:<${MAIL_FROM}>`);
+      const fromOk = await readReply();
+      if (fromOk !== 250) throw new Error("SMTP 拒绝发件人（" + fromOk + "）");
+
+      stage = "rcpt_to";
+      write(`RCPT TO:<${to}>`);
+      const rcptOk = await readReply();
+      if (rcptOk !== 250 && rcptOk !== 251) throw new Error("SMTP 拒绝收件人（" + rcptOk + "）");
+
+      stage = "data";
+      write("DATA");
+      const dataOk = await readReply();
+      if (dataOk !== 354) throw new Error("SMTP 无法开始正文传输（" + dataOk + "）");
+
+      // 正文一律 base64，天然不含裸 CR/LF；标题中的换行做点转义防注入
+      const safeSubject = String(subject).replace(/\r?\n/g, " ").replace(/\./g, "..").slice(0, 100);
+      const headers = [
+        `From: ${MAIL_FROM_NAME} <${MAIL_FROM}>`,
+        `To: <${to}>`,
+        `Subject: ${safeSubject}`,
+        "Date: " + new Date().toUTCString(),
+        "Message-ID: <" + crypto.randomBytes(12).toString("hex") + "@" + (hostname.split(".")[0] || "localhost") + ">",
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=UTF-8",
+        "Content-Transfer-Encoding: base64"
+      ].join("\r\n");
+      const bodyB64 = Buffer.from(text, "utf8").toString("base64").replace(/(.{76})/g, "$1\r\n");
+      write(headers + "\r\n\r\n" + bodyB64);
+      write(".");
+      const endOk = await readReply();
+      if (endOk !== 250) throw new Error("SMTP 退信（" + endOk + "）");
+
+      stage = "quit";
+      try { write("QUIT"); } catch {}
+      settle(resolve, true);
+      // 成功路径不立即 destroy：给 QUIT 一点时间发出，1s 后清理
+      const t = setTimeout(closeSocket, 1000);
+      if (typeof t.unref === "function") t.unref();
+    };
+
+    run().catch(fail);
+
+    deadline = setTimeout(() => {
+      const e = new Error("SMTP 发送超时");
+      e.httpStatus = 502;
+      e.smtpStage = stage;
+      settle(reject, e);
+    }, 30000);
+    if (typeof deadline.unref === "function") deadline.unref();
+  });
+}
+
+/* ---------- 验证码与会话的密码学原语 ---------- */
+const scryptCache = new Map(); // salt(hex) -> key(Buffer)，供同步 timingSafeEqual 使用
+
+function hashCode(code, saltHex) {
+  const salt = saltHex || crypto.randomBytes(16).toString("hex");
+  const key = crypto.scryptSync(String(code), salt, 32);
+  return `${salt}$${key.toString("hex")}`;
+}
+
+function verifyCodeHash(code, stored) {
+  const parts = String(stored || "").split("$");
+  if (parts.length !== 2) return false;
+  const salt = parts[0];
+  const expected = Buffer.from(parts[1], "hex");
+  // 缓存的是「输入 code 在该 salt 下的派生值」，命中即省去一次 scrypt；比较对象始终是库中哈希
+  let actual = scryptCache.get(salt + "|" + String(code));
+  if (!actual) {
+    actual = crypto.scryptSync(String(code), salt, 32);
+    if (scryptCache.size > 512) {
+      for (const k of scryptCache.keys()) { scryptCache.delete(k); break; }
+    }
+    scryptCache.set(salt + "|" + String(code), actual);
+  }
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+const sha256hex = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
+
+function newUserId() {
+  return (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex")).replace(/-/g, "");
+}
+
+const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+
+function normalizeEmail(raw) {
+  const s = String(raw == null ? "" : raw).trim().toLowerCase();
+  if (!s || s.length > 254) return null;
+  if (!EMAIL_RE.test(s)) return null;
+  return s;
+}
+
+/** 从 Cookie 头解析 nt_session 值 */
+function readSessionCookie(req) {
+  const raw = req.headers.cookie;
+  if (typeof raw !== "string" || !raw) return null;
+  for (const part of raw.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() !== SESSION_COOKIE) continue;
+    let v = part.slice(eq + 1).trim();
+    if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+    return v || null;
+  }
+  return null;
+}
+
+/** 会话有效则返回 {userId, email, quotaTotal, sessionId}，否则 null */
+function getSessionUser(req) {
+  if (!db) return null;
+  const token = readSessionCookie(req);
+  if (!token || !/^[A-Za-z0-9_-]{16,128}$/.test(token)) return null;
+  // v2 迁移前的旧行 session_id 可能为 NULL：视为需重新登录（401），避免配额键为 null
+  const row = db.prepare(
+    `SELECT s.user_id AS userId, s.session_id AS sessionId, u.email AS email, u.ai_quota AS quota
+       FROM sessions s JOIN users u ON u.id = s.user_id
+      WHERE s.token_hash = ? AND s.expires_at > ? AND s.session_id IS NOT NULL`
+  ).get(sha256hex(token), Date.now());
+  if (!row) return null;
+  return {
+    userId: row.userId,
+    sessionId: row.sessionId,
+    email: row.email,
+    quotaTotal: Number(row.quota) || AI_QUOTA_PER_DAY
+  };
+}
+
+function createSession(userId, deviceLabel) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  const sessionId = crypto.randomBytes(16).toString("hex");
+  db.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, session_id, device_label) VALUES (?, ?, ?, ?, ?)")
+    .run(sha256hex(token), userId, Date.now() + SESSION_TTL_SEC * 1000, sessionId, String(deviceLabel || "").slice(0, 120));
+  return { token, sessionId };
+}
+
+/** 当日（UTC+8）该会话已用次数 */
+function usedToday(sessionId) {
+  const row = db.prepare("SELECT count AS c FROM ai_usage WHERE session_id = ? AND day = ?")
+    .get(sessionId, localDay());
+  return row ? Number(row.c) || 0 : 0;
+}
+
+function bumpUsage(sessionId, userId) {
+  db.prepare(
+    `INSERT INTO ai_usage (session_id, user_id, day, count) VALUES (?, ?, ?, 1)
+     ON CONFLICT(session_id, day) DO UPDATE SET count = count + 1`
+  ).run(sessionId, userId, localDay());
+}
+
+function quotaPayload(sessionId, total) {
+  const used = usedToday(sessionId);
+  return { remaining: Math.max(0, total - used), total, usedToday: used };
+}
+
+/* ---------- auth 独立限流（内存 map，重启清零可接受；不计入 /api/* 全局限流） ---------- */
+const authRateMap = new Map();
+
+function authConsume(kind, key, limit, windowMs) {
+  const now = Date.now();
+  let entry = authRateMap.get(kind + "|" + key);
+  if (entry && entry.resetAt <= now) entry = null;
+  if (!entry) {
+    if (authRateMap.size >= RATE_MAP_MAX) pruneAuthRateMap(now, true);
+    entry = { count: 0, resetAt: now + windowMs };
+    authRateMap.set(kind + "|" + key, entry);
+  }
+  entry.count++;
+  if (entry.count > limit) {
+    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((entry.resetAt - now) / 1000)) };
+  }
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function pruneAuthRateMap(now, hard) {
+  for (const [key, entry] of authRateMap) {
+    if (!entry || entry.resetAt <= now) authRateMap.delete(key);
+  }
+  if (hard && authRateMap.size >= RATE_MAP_MAX) {
+    authRateMap.clear();
+    console.warn("[auth] 限流表过大，已重置计数");
+  }
+}
+
+/* ---------- 每日清理过期 codes / sessions ---------- */
+function purgeExpired() {
+  if (!db) return;
+  try {
+    const now = Date.now();
+    const c = db.prepare("DELETE FROM codes WHERE expires_at < ?").run(now).changes;
+    const s = db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(now).changes;
+    const u = db.prepare("DELETE FROM ai_usage WHERE day < ?").run(localDay(new Date(now - 2 * 86400000))).changes;
+    if (c || s || u) console.log(`[auth] 清理过期数据：codes=${c} sessions=${s} usage=${u}`);
+  } catch (err) {
+    console.warn("[auth] 清理过期数据失败：" + err.message);
+  }
+}
+
+/* ---------- auth API 处理 ---------- */
+async function authRequestCode(req, res, payload) {
+  if (!requireDb(req, res)) return;
+  if (!AUTH_ENABLED) {
+    return sendJson(req, res, 503, { ok: false, message: "邮件服务未配置，暂时无法发送验证码（请设置 SMTP_HOST/SMTP_USER/SMTP_PASS）" });
+  }
+  const email = normalizeEmail(payload.email);
+  if (!email) {
+    return sendJson(req, res, 400, { ok: false, message: "邮箱格式不正确，请填写有效的邮箱地址" });
+  }
+  const ip = clientIp(req);
+  const cooldown = authConsume("code_mail_cd", email, 1, REQ_CODE_PER_EMAIL_COOLDOWN_SEC * 1000);
+  if (!cooldown.allowed) {
+    return sendJson(req, res, 429, {
+      ok: false,
+      code: "CODE_COOLDOWN",
+      message: `发送太频繁，请 ${cooldown.retryAfterSec} 秒后再试`,
+      retryAfterSec: cooldown.retryAfterSec
+    });
+  }
+  const perDay = authConsume("code_mail_day:" + localDay(), email, REQ_CODE_PER_EMAIL_PER_DAY, 86400000);
+  if (!perDay.allowed) {
+    return sendJson(req, res, 429, {
+      ok: false,
+      code: "CODE_DAILY_LIMIT",
+      message: "该邮箱今日申请验证码次数已达上限，请明天再试",
+      retryAfterSec: perDay.retryAfterSec
+    });
+  }
+  const perIp = authConsume("code_ip_hour", ip, REQ_CODE_PER_IP_PER_HOUR, 3600 * 1000);
+  if (!perIp.allowed) {
+    return sendJson(req, res, 429, {
+      ok: false,
+      code: "CODE_IP_LIMIT",
+      message: "当前网络今日申请验证码次数过多，请稍后再试",
+      retryAfterSec: perIp.retryAfterSec
+    });
+  }
+
+  const code = String(crypto.randomInt(100000, 999999));
+  db.prepare(
+    `INSERT INTO codes (email, purpose, code_hash, expires_at, attempts)
+     VALUES (?, 'register', ?, ?, 0)
+     ON CONFLICT(email, purpose)
+     DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at, attempts = 0`
+  ).run(email, hashCode(code), Date.now() + CODE_TTL_SEC * 1000);
+
+  const text = [
+    `【${MAIL_FROM_NAME}】`,
+    "",
+    `你的登录验证码是：${code}`,
+    "",
+    "验证码 10 分钟内有效，仅可使用一次；请勿转发或告知他人。",
+    "如果你没有申请登录，直接忽略本邮件即可，不会产生任何影响。",
+    "",
+    `—— ${MAIL_FROM_NAME}`
+  ].join("\n");
+
+  try {
+    await smtpSend({ to: email, subject: `${MAIL_FROM_NAME} 登录验证码`, text });
+  } catch (err) {
+    // 发送失败：撤销刚落库的码，避免用户以为已发出
+    try { db.prepare("DELETE FROM codes WHERE email = ? AND purpose = 'register'").run(email); } catch {}
+    console.error("[auth] 发送验证码失败 mail_from=" + maskEmail(MAIL_FROM) + " to=" + maskEmail(email) +
+      " stage=" + (err.smtpStage || "?") + "：" + sanitizeLog(err.message));
+    return sendJson(req, res, 502, {
+      ok: false,
+      code: "MAIL_SEND_FAILED",
+      message: "验证码邮件发送失败（" + (err.smtpStage || "smtp") + "），请稍后重试或联系管理员检查邮件服务配置"
+    });
+  }
+
+  if (AUTH_DEV_LOG_CODE) {
+    console.log(`[auth][dev] 验证码已发送至 ${maskEmail(email)}：${code}`);
+  } else {
+    console.log(`[auth] 验证码已发送至 ${maskEmail(email)}`);
+  }
+  return sendJson(req, res, 200, { ok: true, expiresInSec: CODE_TTL_SEC });
+}
+
+function authVerify(req, res, payload) {
+  if (!requireDb(req, res)) return;
+  const email = normalizeEmail(payload.email);
+  if (!email) {
+    return sendJson(req, res, 400, { ok: false, message: "邮箱格式不正确，请填写有效的邮箱地址" });
+  }
+  const code = String(payload.code == null ? "" : payload.code).trim();
+  if (!/^\d{6}$/.test(code)) {
+    return sendJson(req, res, 400, { ok: false, message: "请输入 6 位数字验证码" });
+  }
+  const ip = clientIp(req);
+  const throttled = authConsume("verify_ip", ip, 30, 3600 * 1000);
+  if (!throttled.allowed) {
+    return sendJson(req, res, 429, { ok: false, code: "VERIFY_THROTTLED", message: "验证尝试过于频繁，请稍后再试", retryAfterSec: throttled.retryAfterSec });
+  }
+
+  const row = db.prepare("SELECT code_hash, expires_at, attempts FROM codes WHERE email = ? AND purpose = 'register'").get(email);
+  if (!row) {
+    return sendJson(req, res, 400, { ok: false, code: "CODE_NOT_FOUND", message: "验证码不存在或已重新发送，请重新获取" });
+  }
+  if (Number(row.expires_at) <= Date.now()) {
+    db.prepare("DELETE FROM codes WHERE email = ? AND purpose = 'register'").run(email);
+    return sendJson(req, res, 400, { ok: false, code: "CODE_EXPIRED", message: "验证码已过期，请重新获取" });
+  }
+  const attempts = Number(row.attempts) || 0;
+  if (attempts >= CODE_MAX_ATTEMPTS) {
+    db.prepare("DELETE FROM codes WHERE email = ? AND purpose = 'register'").run(email);
+    return sendJson(req, res, 400, { ok: false, code: "CODE_LOCKED", message: "验证码错误次数过多已作废，请重新获取" });
+  }
+  if (!verifyCodeHash(code, row.code_hash)) {
+    const left = CODE_MAX_ATTEMPTS - attempts - 1;
+    db.prepare("UPDATE codes SET attempts = attempts + 1 WHERE email = ? AND purpose = 'register'").run(email);
+    return sendJson(req, res, 400, {
+      ok: false,
+      code: "CODE_INVALID",
+      message: left > 0 ? `验证码不正确，还可尝试 ${left} 次` : "验证码错误次数过多已作废，请重新获取"
+    });
+  }
+
+  // 一次性使用：无论后续如何都删除该码
+  db.prepare("DELETE FROM codes WHERE email = ? AND purpose = 'register'").run(email);
+
+  let user = db.prepare("SELECT id, email, ai_quota AS quota FROM users WHERE email = ?").get(email);
+  if (!user) {
+    const id = newUserId();
+    try {
+      db.prepare("INSERT INTO users (id, email, created_at, ai_quota) VALUES (?, ?, ?, ?)")
+        .run(id, email, Date.now(), AI_QUOTA_PER_DAY);
+    } catch (insErr) {
+      // 并发注册撞 UNIQUE：回读既有行即可
+      const existing = db.prepare("SELECT id, email, ai_quota AS quota FROM users WHERE email = ?").get(email);
+      if (!existing) throw insErr;
+      user = existing;
+    }
+    if (!user) user = { id, email, quota: AI_QUOTA_PER_DAY };
+  }
+  const sess = createSession(user.id, req.headers["user-agent"]);
+  const quota = quotaPayload(sess.sessionId, Number(user.quota) || AI_QUOTA_PER_DAY);
+  console.log(`[auth] 登录成功 ${maskEmail(email)}（ip=${ip}）`);
+  return sendJson(req, res, 200, { ok: true, user: { email: user.email, quota } }, {
+    "Set-Cookie": `${SESSION_COOKIE}=${sess.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_SEC}`
+  });
+}
+
+function authMe(req, res) {
+  if (!requireDb(req, res)) return;
+  const user = getSessionUser(req);
+  if (!user) {
+    return sendJson(req, res, 401, { ok: false, code: "NOT_LOGGED_IN", message: "尚未登录" });
+  }
+  const quota = quotaPayload(user.sessionId, user.quotaTotal);
+  return sendJson(req, res, 200, { ok: true, user: { email: user.email, quota } });
+}
+
+function authLogout(req, res) {
+  if (!requireDb(req, res)) return;
+  const token = readSessionCookie(req);
+  if (token) {
+    try { db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(sha256hex(token)); } catch {}
+  }
+  return sendJson(req, res, 200, { ok: true }, {
+    "Set-Cookie": `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`
+  });
+}
+
+/** AI 端点门禁：未登录 401 LOGIN_REQUIRED；当日额度用完 429 QUOTA_EXCEEDED（按会话计） */
+function gateAi(req, res) {
+  if (!db) return null;
+  const user = getSessionUser(req);
+  if (!user) {
+    sendJson(req, res, 401, { ok: false, code: "LOGIN_REQUIRED", message: "请先注册登录后使用 AI 功能" });
+    return null;
+  }
+  const total = user.quotaTotal;
+  const used = usedToday(user.sessionId);
+  if (used >= total) {
+    const retryAfterSec = secondsToNextLocalMidnight(Date.now());
+    res.setHeader("Retry-After", String(retryAfterSec));
+    sendJson(req, res, 429, {
+      ok: false,
+      code: "QUOTA_EXCEEDED",
+      message: `今日 AI 试用额度（${total} 次）已用完，请明天再来`,
+      retryAfterSec
+    });
+    return null;
+  }
+  return { user, total };
 }
 
 /* ---------- API 处理 ---------- */
@@ -832,12 +1520,32 @@ function healthPayload() {
       windowMin: RATE_WINDOW_MIN,
       trustProxy: TRUST_PROXY
     },
+    // 账号体系与 AI 额度（v3.6）：mailProvider 摘要不含任何密钥/授权码
+    authEnabled: AUTH_ENABLED,
+    mailProvider: {
+      host: SMTP_HOST || null,
+      port: SMTP_PORT,
+      user: SMTP_USER ? maskEmail(SMTP_USER) : null,
+      configured: AUTH_ENABLED,
+      error: dbError ? "数据库初始化失败" : null
+    },
+    aiQuota: {
+      perDay: AI_QUOTA_PER_DAY,
+      scope: "session",        // 按登录会话（浏览器设备）计数，day 为 UTC+8
+      timezone: "UTC+8",
+      storage: db ? "sqlite" : "unavailable"
+    },
     uptimeSec: Math.round(process.uptime())
   };
 }
 
 async function handleApi(req, res, pathname) {
   const isHealth = pathname === "/api/health" && (req.method === "GET" || req.method === "HEAD");
+
+  // auth 端点走独立限流（见 authConsume），不计入 /api/* 全局 IP 限流，否则用户会被自己的请求锁死
+  if (pathname === "/api/auth" || pathname.startsWith("/api/auth/")) {
+    return handleAuthApi(req, res, pathname);
+  }
 
   // /api/health 不计入限流（前端探测与 Docker HEALTHCHECK 会周期性调用）
   if (!isHealth) {
@@ -861,6 +1569,15 @@ async function handleApi(req, res, pathname) {
     return sendJson(req, res, 405, { ok: false, message: "Method Not Allowed：该接口仅支持 POST" });
   }
 
+  // AI 门禁：未登录 401 LOGIN_REQUIRED；当日额度用完 429 QUOTA_EXCEEDED（按会话计）
+  const aiEndpoints = ["/api/food-search", "/api/estimate-photo", "/api/scan-label"];
+  let gate = null;
+  if (aiEndpoints.includes(pathname)) {
+    if (!requireDb(req, res)) return;
+    gate = gateAi(req, res);
+    if (!gate) return;
+  }
+
   const handler =
     pathname === "/api/food-search" ? (p) => foodSearch(p.query) :
     pathname === "/api/estimate-photo" ? (p) => estimatePhoto(p) :
@@ -882,11 +1599,19 @@ async function handleApi(req, res, pathname) {
 
   try {
     const out = await handler(payload);
-    return sendJson(req, res, 200, { ok: true, ...out });
+    // 成功调用才计入额度（缓存命中同样计一次）
+    let quotaHeader = null;
+    if (gate) {
+      bumpUsage(gate.user.sessionId, gate.user.userId);
+      const used = usedToday(gate.user.sessionId);
+      quotaHeader = { remaining: Math.max(0, gate.total - used), total: gate.total, usedToday: used };
+      res.setHeader("X-AI-Quota-Remaining", String(quotaHeader.remaining));
+    }
+    return sendJson(req, res, 200, quotaHeader ? { ok: true, ...out, quota: quotaHeader } : { ok: true, ...out });
   } catch (err) {
     const status = err.httpStatus || 500;
-    console.error("[api]", pathname, status, sanitizeUpstream(err.message));
-    const body = { ok: false, message: sanitizeUpstream(err.message) || "AI 服务异常" };
+    console.error("[api]", pathname, status, sanitizeLog(err.message));
+    const body = { ok: false, message: sanitizeLog(err.message) || "AI 服务异常" };
     if (err.code) body.code = err.code;
     if (err.retryAfterSec) {
       // 429（账号并发/频率限制）时回传 retryAfterSec，前端可据此提示等待时长
@@ -894,6 +1619,52 @@ async function handleApi(req, res, pathname) {
       res.setHeader("Retry-After", String(err.retryAfterSec));
     }
     return sendJson(req, res, status, body);
+  }
+}
+
+/** /api/auth/* 路由：request-code / verify / me / logout */
+async function handleAuthApi(req, res, pathname) {
+  const route = pathname.slice("/api/auth".length).replace(/^\/+/, "");
+  const methods = {
+    "request-code": "POST",
+    verify: "POST",
+    me: "GET",
+    logout: "POST"
+  };
+  if (!Object.prototype.hasOwnProperty.call(methods, route)) {
+    return sendJson(req, res, 404, { ok: false, message: "未知接口" });
+  }
+  const allow = methods[route];
+  if (req.method !== allow && !(req.method === "HEAD" && allow === "GET")) {
+    res.setHeader("Allow", allow);
+    return sendJson(req, res, 405, { ok: false, message: `Method Not Allowed：该接口仅支持 ${allow}` });
+  }
+  if (!db) {
+    return sendJson(req, res, 503, { ok: false, message: "服务端存储暂不可用，请稍后重试" });
+  }
+
+  let payload = {};
+  if (allow === "POST") {
+    try {
+      const raw = await readBody(req, 64 * 1024);
+      payload = JSON.parse(raw || "{}");
+    } catch (err) {
+      const status = err.httpStatus || 400;
+      return sendJson(req, res, status, { ok: false, message: "请求格式错误：" + sanitizeLog(err.message) });
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return sendJson(req, res, 400, { ok: false, message: "请求格式错误：请求体必须是 JSON 对象" });
+    }
+  }
+
+  try {
+    if (route === "request-code") return await authRequestCode(req, res, payload);
+    if (route === "verify") return authVerify(req, res, payload);
+    if (route === "me") return authMe(req, res);
+    return authLogout(req, res);
+  } catch (err) {
+    console.error("[auth]", pathname, sanitizeLog(err && err.stack ? err.stack : String(err)));
+    return sendJson(req, res, 500, { ok: false, message: "服务器内部错误" });
   }
 }
 
@@ -1046,6 +1817,15 @@ server.listen(PORT, HOST, () => {
   if (!API_KEY) {
     console.warn("[nutrition] 警告：未配置 KIMI_API_KEY，AI 接口将返回 503（本地记录/查询等功能不受影响）");
   }
+
+  // 账号体系状态：SMTP 未配齐时无法发验证码；DB 不可用时 AI 与 auth 均返回 503
+  if (AUTH_ENABLED) {
+    console.log(`[auth] 邮箱验证码登录已启用：SMTP ${SMTP_HOST}:${SMTP_PORT}（TLS）、发件人 ${maskEmail(MAIL_FROM)}、额度 ${AI_QUOTA_PER_DAY} 次/会话/天`);
+  } else {
+    console.warn("[auth] ⚠ 未配置 SMTP_HOST/SMTP_USER/SMTP_PASS：无法发送验证码，AI 功能将对所有人返回 401 LOGIN_REQUIRED");
+  }
+  if (!db) console.warn("[auth] ⚠ SQLite 存储不可用，auth 与 AI 接口将返回 503");
+  if (AUTH_DEV_LOG_CODE) console.warn("[auth] ⚠ AUTH_DEV_LOG_CODE=1：验证码会打印到服务端日志，仅限本地调试，生产务必关闭");
 });
 
 /* ---------- 优雅关闭 ---------- */
@@ -1056,6 +1836,7 @@ function shutdown(signal) {
   shuttingDown = true;
   console.log(`[nutrition] 收到 ${signal}，正在停止接收新连接…`);
   clearInterval(ratePruneTimer);
+  clearInterval(purgeTimer);
   let exitTimer = setTimeout(() => {
     console.warn("[nutrition] 仍有连接未关闭，强制退出");
     try { server.closeAllConnections(); } catch {}
@@ -1065,6 +1846,7 @@ function shutdown(signal) {
 
   server.close(() => {
     clearTimeout(exitTimer);
+    try { if (db) db.close(); } catch {}
     console.log("[nutrition] 已安全关闭");
     process.exit(0);
   });
