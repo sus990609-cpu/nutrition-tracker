@@ -632,6 +632,14 @@ async function aiEstimatePhoto(payload) {
   });
 }
 
+async function aiScanLabel(image) {
+  return fetchJson(apiUrl("scan-label"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ image })
+  });
+}
+
 function setBusy(btn, busy, label) {
   if (!btn) return;
   if (busy) {
@@ -2057,6 +2065,79 @@ function saveCustomFood() {
   alert(`已保存「${name}」，并已选中，可直接输入食用量。`);
 }
 
+const LABEL_GRAIN_RE = /麦片|燕麦|小麦|全麦|谷物|面包|馒头|包子|面条|米粉|米线|粥|饼|饭/;
+
+/** 标签识别结果（/api/scan-label）→ renderParsedForm 兼容的 parsed 结构 */
+const LABEL_WARN_SKIP = /^(图片中)?看不清或缺失的信息?$/;
+function labelToParsed(label) {
+  const p = label.per100 || {};
+  const warnings = [];
+  if (label.basis === "serving") warnings.push("营养成分表按「每份」标注，已暂按每 100g 填入，请核对后手动换算。");
+  for (const k of ["kcal", "protein", "carbs", "fat"]) {
+    if (p[k] === null || p[k] === undefined) warnings.push(`未识别到${{ kcal: "能量(kcal)", protein: "蛋白质", carbs: "碳水化合物", fat: "脂肪" }[k]}，请对照包装补填。`);
+  }
+  (Array.isArray(label.warnings) ? label.warnings : []).forEach(w => { if (w && !LABEL_WARN_SKIP.test(String(w).trim())) warnings.push(String(w)); });
+  const textForCat = (label.productName || "") + "|" + (label.ingredients || []).join(",");
+  return {
+    ok: true,
+    ingredientOnly: false,
+    aiSource: true,
+    warnings,
+    data: {
+      name: label.productName || "",
+      brand: label.brand || "",
+      category: LABEL_GRAIN_RE.test(textForCat) ? "主食" : detectCategory(textForCat),
+      basis: label.basis === "100ml" ? "100ml" : "100g",
+      netGrams: label.netContentGrams || null,
+      servingLabel: "",
+      barcode: "",
+      nutrition: { calories: p.kcal ?? null, protein: p.protein ?? null, carbs: p.carbs ?? null, fat: p.fat ?? null, sodium: p.sodiumMg ?? null },
+      ingredients: label.ingredients || []
+    }
+  };
+}
+
+/* ---------- 拍照识标签：上传 → AI 识别 → 预填核对表单（保存仍由用户确认） ---------- */
+async function runTrackerLabelScan(file) {
+  const box = $("#trackerPanel");
+  if (!box) return;
+  if (!(await ensureApiReady(box))) return;
+  setBusy($("#trackerScanBtn"), true, "AI 识别中…");
+  box.innerHTML = '<p class="hint">正在识别包装上的营养成分表，通常需要 5~15 秒…</p>';
+  try {
+    const image = await fileToCompressedDataUrl(file);
+    const data = await aiScanLabel(image);
+    box.innerHTML = "";
+    renderParsedForm(labelToParsed(data));
+  } catch (e) {
+    box.innerHTML = `<p class="error-text">${esc(e.message)}</p><p class="hint">请对准「营养成分表」拍清晰些再试，或改用粘贴文本。</p>`;
+  } finally {
+    setBusy($("#trackerScanBtn"), false);
+  }
+}
+
+function bindTrackerPanel() {
+  const dz = $("#trackerDropzone");
+  const input = $("#trackerLabelInput");
+  if (!dz || !input) return;
+  const pick = () => input.click();
+  dz.addEventListener("click", (e) => { if (e.target !== input) pick(); });
+  dz.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+  ["dragenter", "dragover"].forEach(evt => dz.addEventListener(evt, (e) => { e.preventDefault(); dz.classList.add("dragover"); }));
+  ["dragleave", "drop"].forEach(evt => dz.addEventListener(evt, (e) => { e.preventDefault(); dz.classList.remove("dragover"); }));
+  dz.addEventListener("drop", (e) => {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) runTrackerLabelScan(file);
+  });
+  input.addEventListener("change", () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (file) runTrackerLabelScan(file);
+  });
+  const scanBtn = $("#trackerScanBtn");
+  if (scanBtn) scanBtn.addEventListener("click", pick);
+}
+
 function renderTracker() {
   const container = $("#trackerEntries");
   const totalBox = $("#trackerTotal");
@@ -2249,7 +2330,7 @@ function renderParsedForm(parsed) {
       <div class="form-row"><label>配料表（识别内容，仅供核对）</label>
         <textarea id="ppIngredients" rows="2">${esc((d.ingredients || []).join("、"))}</textarea>
       </div>
-      <p class="hint">${parsed.ingredientOnly ? "仅有配料表：不会自动生成营养数值，请手动填写或保留为待确认。" : "数值来自你粘贴的营养成分表，请以包装为准。"}</p>
+      <p class="hint">${parsed.ingredientOnly ? "仅有配料表：不会自动生成营养数值，请手动填写或保留为待确认。" : parsed.aiSource ? "数值来自 AI 对包装照片的识别，可能有误差，请逐项核对后再保存（可直接修改）。" : "数值来自你粘贴的营养成分表，请以包装为准。"}</p>
       <div class="btn-row">
         <button class="btn primary" id="saveParsedBtn">保存为自定义食品</button>
         <button class="btn secondary" id="cancelParsedBtn">取消</button>
@@ -2990,6 +3071,7 @@ function bindInstallPrompt() {
 function init() {
   bindNav();
   bindTracker();
+  bindTrackerPanel();
   bindFoods();
   bindBody();
   bindPlan();
