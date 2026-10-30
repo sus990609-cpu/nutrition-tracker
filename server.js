@@ -1,7 +1,7 @@
 /**
- * 每日营养管家 - 自托管后端（v3.4.0）
+ * 每日营养管家 - 自托管后端（v3.5.0）
  * - 静态文件服务（带 no-store，避免改完看不到变化）
- * - Kimi API 同源代理：/api/food-search、/api/estimate-photo
+ * - AI 同源代理：/api/food-search、/api/estimate-photo、/api/scan-label（营养成分表识别）
  * - API Key 只从环境变量 / .env 读取，绝不下发到前端
  * - 账号 RPM 限制（默认 3 次/分钟）由串行队列与缓存兜底；另有按客户端 IP 的 /api/* 限流
  * - 零依赖，仅使用 Node.js 内置模块（要求 Node >= 18）
@@ -34,7 +34,7 @@ const ROOT_REAL = (() => {
   try { return fs.realpathSync(ROOT); } catch { return ROOT; }
 })();
 // 与 package.json 的 version 保持一致
-const VERSION = "3.4.0";
+const VERSION = "3.5.0";
 
 /* ---------- 配置加载 ---------- */
 function loadEnvFile() {
@@ -661,6 +661,87 @@ async function estimatePhoto(payload) {
   return { ...out, model: r.model };
 }
 
+/* ---------- 营养成分表照片识别（AI 标签扫描） ---------- */
+const LABEL_MAX_TOKENS = 2000;
+
+/** 归一化标签识别结果：字段缺失一律 null，绝不编造 */
+function normalizeLabelResult(raw) {
+  const o = raw && typeof raw === "object" ? raw : {};
+  const n = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const x = Number(v);
+    return Number.isFinite(x) && x >= 0 ? x : null;
+  };
+  const p = o.per100 && typeof o.per100 === "object" ? o.per100 : {};
+  const basis = ["100g", "100ml", "serving"].includes(o.basis) ? o.basis : "100g";
+  let kcal = n(p.kcal);
+  const kj = n(p.energyKj);
+  if (kcal === null && kj !== null) kcal = Math.round(kj / 4.184);
+  const warnings = Array.isArray(o.warnings) ? o.warnings.map(x => String(x).slice(0, 160)).filter(Boolean).slice(0, 8) : [];
+  return {
+    productName: String(o.productName || "").trim().slice(0, 80),
+    brand: String(o.brand || "").trim().slice(0, 40),
+    netContentGrams: n(o.netContentGrams),
+    basis,
+    per100: {
+      energyKj: kj, kcal,
+      protein: n(p.protein), fat: n(p.fat), saturatedFat: n(p.saturatedFat),
+      carbs: n(p.carbs), sugar: n(p.sugar), fiber: n(p.fiber), sodiumMg: n(p.sodiumMg)
+    },
+    ingredients: (Array.isArray(o.ingredients) ? o.ingredients : []).map(x => String(x).slice(0, 60)).filter(Boolean).slice(0, 15),
+    warnings
+  };
+}
+
+async function scanLabel(payload) {
+  const image = String(payload.image || "");
+  if (!/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/.test(image)) {
+    const e = new Error("请提供有效的图片（PNG/JPEG/WebP）");
+    e.httpStatus = 400;
+    throw e;
+  }
+  if (image.length > 12 * 1024 * 1024) {
+    const e = new Error("图片过大，请压缩后再试");
+    e.httpStatus = 413;
+    throw e;
+  }
+  const prompt = [
+    "这是一张食品包装背面的照片。请提取以下信息，只输出 JSON（不要 Markdown 代码块）：",
+    '{"productName":"","brand":"","netContentGrams":null,"basis":"100g|100ml|serving","per100":{"energyKj":null,"kcal":null,"protein":null,"fat":null,"saturatedFat":null,"carbs":null,"sugar":null,"fiber":null,"sodiumMg":null},"ingredients":[],"warnings":["图片中看不清或缺失的信息"]}',
+    "规则：",
+    "1. netContentGrams 为整包净含量换算成克（如 1.4千克=1400；液体按 ml 数值填）。",
+    "2. kcal 按能量千焦/4.184 换算后四舍五入到整数。",
+    "3. basis 标注营养成分表的基准（每100克/每100毫升/每份）。",
+    "4. 看不清或没有的字段填 null，不要编造；模糊的字放进 warnings 说明。",
+    "5. ingredients 为配料表按顺序拆分（可只取前 10 项）。"
+  ].join("\n");
+  const r = await callModel(VISION_MODEL, [
+    { role: "system", content: "你是食品包装标签识别助手。只输出 JSON。" },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: image } }
+      ]
+    }
+  ], LABEL_MAX_TOKENS, { vision: true, apiKey: VISION_API_KEY });
+  const parsed = extractJson(r.content);
+  if (!parsed) {
+    const e = new Error(r.finishReason === "length"
+      ? "AI 输出被截断（标签信息过于复杂），请拍近一点重试"
+      : "未能从图片中识别出营养标签，请对准「营养成分表」重新拍摄");
+    e.httpStatus = 502;
+    throw e;
+  }
+  const out = normalizeLabelResult(parsed);
+  if (!out.productName && !Object.values(out.per100).some(v => v !== null)) {
+    const e = new Error("图片中未识别到商品信息，请上传清晰的包装背面营养成分表照片");
+    e.httpStatus = 422;
+    throw e;
+  }
+  return { ...out, model: r.model };
+}
+
 /* ---------- 响应工具 ---------- */
 function applySecurityHeaders(res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -737,6 +818,7 @@ function healthPayload() {
     hasApiKey: Boolean(API_KEY),
     // 视觉模型独立供应商（默认阿里云百炼 qwen3-vl-flash）
     visionProvider: { model: VISION_MODEL, baseUrl: VISION_BASE.href, hasApiKey: Boolean(VISION_API_KEY) },
+    labelScan: Boolean(VISION_API_KEY || API_KEY),
     // 429（账号并发/频率限制）重试配置，便于排查
     aiRetry: {
       maxRetries: AI_MAX_RETRIES,
@@ -782,6 +864,7 @@ async function handleApi(req, res, pathname) {
   const handler =
     pathname === "/api/food-search" ? (p) => foodSearch(p.query) :
     pathname === "/api/estimate-photo" ? (p) => estimatePhoto(p) :
+    pathname === "/api/scan-label" ? (p) => scanLabel(p) :
     null;
   if (!handler) return sendJson(req, res, 404, { ok: false, message: "未知接口" });
 
