@@ -1,6 +1,6 @@
 {
   "name": "nutrition-tracker",
-  "version": "3.5.0",
+  "version": "3.6.0",
   "private": true,
   "description": "每日营养管家：本地单页应用 + 零依赖 Node 服务（静态页 + OpenAI 兼容 AI 代理，PWA 可安装，可自托管/可分享）",
   "main": "server.js",
@@ -9,7 +9,7 @@
     "test": "node test-harness.cjs"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5"
   },
   "keywords": [
     "nutrition",
