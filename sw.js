@@ -5,7 +5,7 @@
  * - /api/*：始终走网络（AI 结果不缓存）
  * - 版本升级：安装新 SW 后清理旧缓存并立即接管
  */
-const CACHE_NAME = "nutrition-tracker-v3.5.0-1";
+const CACHE_NAME = "nutrition-tracker-v3.6.0-1";
 const SHELL = [
   "/",
   "/index.html",
