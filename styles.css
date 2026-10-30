@@ -905,4 +905,12 @@ html[data-theme="dark"] .brand-card-pack { color: #7dd3a0; }
   .install-btn { padding: 7px 10px; font-size: 11.5px; min-height: 44px; }
 }
 
+/* ================= v3.5 拍照识别营养成分表 ================= */
+.label-scan { margin-top: 20px; padding-top: 16px; border-top: 1px dashed var(--border); }
+.label-scan h4 { margin: 0 0 6px; font-size: 15px; }
+.dropzone-sm { min-height: 110px; margin: 10px 0; }
+.dropzone-sm .dropzone-inner p { margin: 4px 0; font-size: 13px; }
+.dropzone-sm .dropzone-icon { font-size: 26px; margin-bottom: 2px; }
+html[data-theme="dark"] .label-scan { border-top-color: var(--border); }
+
 
